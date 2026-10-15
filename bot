@@ -75,7 +75,7 @@ class AntiNukeBot(commands.Bot):
         await self.db.commit()
         
         self.loop.create_task(self.status_task())
-        print(f"zainn bot active✌ | Logged in as: {self.user}")
+        print(f"Fran bot active✌ | Logged in as: {self.user}")
 
     async def status_task(self):
         await self.wait_until_ready()
