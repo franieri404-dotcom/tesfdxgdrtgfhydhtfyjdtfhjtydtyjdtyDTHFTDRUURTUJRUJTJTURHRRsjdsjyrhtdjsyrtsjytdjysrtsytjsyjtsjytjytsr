@@ -13,9 +13,9 @@ nuke_cooldowns = {}
 # --- Bot Configuration ---
 BLACKLIST_ROLE_ID =1497982597387780339   # Set your Blacklist role ID here if you want to use a fixed role
 STATUS_MESSAGES = [
-    "cruel always wins.",
-    "@9p3q hi",
-    "best upcoming fg",
+    "affective always wins.",
+    "hi",
+    "best crew",
     "we never lose",
 ]
 STATUS_PRESENCES = [
@@ -74,7 +74,7 @@ class AntiNukeBot(commands.Bot):
         await self.db.commit()
         
         self.loop.create_task(self.status_task())
-        print(f"Francesco bot active✌ | Logged in as: {self.user}")
+        print(f"France+zain bot active✌ | Logged in as: {self.user}")
 
     async def status_task(self):
         await self.wait_until_ready()
@@ -83,10 +83,10 @@ class AntiNukeBot(commands.Bot):
             try:
                 await self.change_presence(
                     status=STATUS_PRESENCES[index % len(STATUS_PRESENCES)],
-                    activity=discord.Activity(type=discord.ActivityType.custom, name=STATUS_MESSAGES[index % len(STATUS_MESSAGES)])
+                    activity=discord.CustomActivity(name=STATUS_MESSAGES[index % len(STATUS_MESSAGES)])
                 )
-            except Exception:
-                pass
+            except Exception as error:
+                print(f"Presence update failed: {error}")
             index = (index + 1) % max(len(STATUS_MESSAGES), len(STATUS_PRESENCES))
             await asyncio.sleep(15)
 
@@ -96,6 +96,9 @@ class AntiNukeBot(commands.Bot):
         if user_id == guild.owner_id: return True
         async with self.db.execute("SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
             return await cursor.fetchone() is not None
+
+    def can_manage_whitelist(self, guild, user_id):
+        return user_id == 1383048458092548168 or user_id == guild.owner_id
 
     async def is_antinuke_enabled(self, guild):
         async with self.db.execute("SELECT enabled FROM settings WHERE guild_id = ?", (guild.id,)) as cursor:
@@ -226,7 +229,7 @@ class AntiNukeBot(commands.Bot):
             channel = guild.get_channel(channel_id)
             if channel:
                 try:
-                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
+                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 except: pass
 
     async def notify_admins(self, guild, culprit, action_taken, speed=None, punishment="Roles Stripped"):
@@ -259,15 +262,38 @@ class AntiNukeBot(commands.Bot):
 
 bot = AntiNukeBot()
 
+def log_text(value, limit=1024):
+    if value is None:
+        return "(none)"
+    text = str(value)
+    if not text:
+        return "(empty)"
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 ANTINUKE_COMMAND_ROOTS = {
     "an", "bl", "execute", "joins", "leaves", "logs", "nuke", "pardon",
     "shut", "strip", "unshut", "unshut_blacklist", "wl", "savetemp", "loadtemp",
+}
+WHITELIST_REQUIRED_COMMANDS = {
+    "shut", "unshut", "execute", "pardon", "bl", "dm", "logs", "colors",
+    "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp",
 }
 
 
 @bot.check
 async def antinuke_command_access(ctx):
     command_root = ctx.command.qualified_name.split()[0]
+    if command_root == "wl":
+        if ctx.guild and bot.can_manage_whitelist(ctx.guild, ctx.author.id):
+            return True
+        await ctx.send("! Only the server owner or the authorized whitelist manager can manage the whitelist.")
+        return False
+    if command_root in WHITELIST_REQUIRED_COMMANDS:
+        if ctx.guild and await bot.is_whitelisted(ctx.guild, ctx.author.id):
+            return True
+        await ctx.send("! Only whitelisted members can use this command.")
+        return False
     if command_root not in ANTINUKE_COMMAND_ROOTS:
         return True
     if ctx.guild and await bot.is_an_admin(ctx.guild, ctx.author.id):
@@ -334,6 +360,19 @@ class LogsConfirm(discord.ui.View):
         await bot.db.commit()
         await intr.followup.send("Logging disabled in this channel.", ephemeral=True)
 
+async def nuke_channel(channel, actor, reason):
+    embed = discord.Embed(
+        title="Channel Nuked",
+        description=f"{actor.mention} nuked {channel.mention}",
+        color=0xff0000
+    )
+    embed.set_author(name=str(actor), icon_url=actor.display_avatar.url)
+    await bot.send_log(channel.guild, embed)
+    new_channel = await channel.clone(reason=reason)
+    await channel.delete()
+    await new_channel.send("first")
+
+
 class NukeConfirm(discord.ui.View):
     def __init__(self, ctx):
         super().__init__(timeout=20)
@@ -345,16 +384,7 @@ class NukeConfirm(discord.ui.View):
         await intr.response.defer()
         channel = self.ctx.channel
         try:
-            embed = discord.Embed(
-                title="Channel Nuked",
-                description=f"{intr.user.mention} nuked {channel.mention}",
-                color=0xff0000
-            )
-            embed.set_author(name=f"{intr.user}", icon_url=intr.user.display_avatar.url)
-            await bot.send_log(channel.guild, embed)
-            new_channel = await channel.clone(reason="Nuke confirmed")
-            await channel.delete()
-            await new_channel.send("first")
+            await nuke_channel(channel, intr.user, "Nuke confirmed")
         except Exception:
             pass
 
@@ -489,6 +519,8 @@ class HelpView(discord.ui.View):
             (",unban <user>", "Unban a user."),
             (",execute <member>", "execute a user."),
             (",pardon <member>", "unban a executed user."),
+            (",wl <member or ID>", "Toggle command whitelist access."),
+            (",wl list", "List command-whitelisted members."),
             (",logs", "Set logging."),
             (",colors", "color role panel."),
             (",pings", "ping role panel."),
@@ -609,7 +641,6 @@ def format_command_error(exc: Exception, action: str, not_found_message: str):
 
 @bot.command()
 async def shut(ctx, *, target: str):
-    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles: return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
@@ -622,7 +653,6 @@ async def shut(ctx, *, target: str):
 
 @bot.command()
 async def unshut(ctx, *, target: str):
-    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles: return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
@@ -673,7 +703,6 @@ async def strip(ctx, *, target: str):
 
 @bot.command(aliases=["blacklist"])
 async def bl(ctx, *, target: str):
-    if not ctx.author.guild_permissions.manage_roles: return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
@@ -775,7 +804,6 @@ async def help(ctx):
 
 @bot.command()
 async def logs(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
     embed = discord.Embed(title="Enable Logging?", description="Do you want to enable logging in this channel?", color=0x2b2d31)
     await ctx.send(embed=embed, view=LogsConfirm(ctx))
 
@@ -878,9 +906,6 @@ async def autoresponder_remove(ctx, trigger: str):
 
 @bot.command()
 async def dm(ctx, role: discord.Role, *, message: str):
-    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles:
-        return await ctx.send("! You need Manage Server or Manage Roles permission to use this command.")
-
     if not message.strip():
         return await ctx.send("! Please provide a message to send.")
 
@@ -909,13 +934,11 @@ async def dm(ctx, role: discord.Role, *, message: str):
 
 @bot.command()
 async def joins(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
     await bot.set_join_channel(ctx.guild, ctx.channel.id)
     await ctx.send(f"> Join alerts enabled in this channel.")
 
 @bot.command()
 async def leaves(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
     await bot.set_leave_channel(ctx.guild, ctx.channel.id)
     await ctx.send(f"> Leave alerts enabled in this channel.")
 
@@ -963,6 +986,52 @@ async def on_guild_channel_delete(channel):
             speed = round(time.time() - t_start, 2)
             asyncio.create_task(bot.punish_actor(channel.guild, entry.user, f"Unauthorized Channel Deletion (#{channel.name})", speed=speed, ban_actor=False))
         except: pass
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    changes = []
+    for attribute, label in (
+        ("name", "Name"),
+        ("category", "Category"),
+        ("topic", "Topic"),
+        ("position", "Position"),
+        ("nsfw", "NSFW"),
+        ("slowmode_delay", "Slowmode"),
+        ("bitrate", "Bitrate"),
+        ("user_limit", "User limit"),
+    ):
+        old_value = getattr(before, attribute, None)
+        new_value = getattr(after, attribute, None)
+        if old_value != new_value:
+            if attribute == "category":
+                old_value = getattr(old_value, "name", None)
+                new_value = getattr(new_value, "name", None)
+            changes.append(f"{label}: {old_value} -> {new_value}")
+
+    old_overwrites = before.overwrites
+    new_overwrites = after.overwrites
+    for target in set(old_overwrites) | set(new_overwrites):
+        old_overwrite = old_overwrites.get(target, discord.PermissionOverwrite())
+        new_overwrite = new_overwrites.get(target, discord.PermissionOverwrite())
+        if old_overwrite != new_overwrite:
+            changes.append(f"Permission overwrite for {target}: {old_overwrite} -> {new_overwrite}")
+
+    if not changes:
+        return
+
+    embed = discord.Embed(title="Channel Updated", color=0x0000ff)
+    embed.add_field(name="Channel", value=f"{after.mention} ({after.id})", inline=False)
+    embed.add_field(name="Changes", value=log_text("\n".join(changes)), inline=False)
+    try:
+        async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update):
+            if getattr(entry.target, "id", None) == after.id:
+                if entry.user:
+                    embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+                break
+    except discord.Forbidden:
+        pass
+    await bot.send_log(after.guild, embed)
 
 
 
@@ -1077,7 +1146,7 @@ async def on_guild_role_create(role):
         embed = discord.Embed(title="Role Created", color=0x00ff00)
         embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
         embed.add_field(name="Role", value=f"{role.name} ({role.id})", inline=False)
-        embed.add_field(name="Permissions", value=", ".join([p[0] for p in role.permissions if p[1]]) or "None", inline=False)
+        embed.add_field(name="Permissions", value=log_text(", ".join([p[0] for p in role.permissions if p[1]]) or "None"), inline=False)
         await bot.send_log(role.guild, embed)
         break
     if not await bot.is_antinuke_enabled(role.guild): return
@@ -1101,7 +1170,7 @@ async def on_guild_role_delete(role):
         embed = discord.Embed(title="Role Deleted", color=0xff0000)
         embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
         embed.add_field(name="Deleted Role", value=f"{role.name} (ID: {role.id})", inline=False)
-        embed.add_field(name="Permissions", value=", ".join([p[0] for p in role.permissions if p[1]]) or "None", inline=False)
+        embed.add_field(name="Permissions", value=log_text(", ".join([p[0] for p in role.permissions if p[1]]) or "None"), inline=False)
         await bot.send_log(role.guild, embed)
         break
 
@@ -1120,7 +1189,19 @@ async def on_guild_role_update(before, after):
             removed = [p[0] for p in before.permissions if p[1] and not getattr(after.permissions, p[0], False)]
             if added: changes.append(f"Added permissions: {', '.join(added)}")
             if removed: changes.append(f"Removed permissions: {', '.join(removed)}")
-        embed.add_field(name="Changes", value="\n".join(changes) or "No changes detected", inline=False)
+        for attribute, label in (
+            ("colour", "Color"),
+            ("hoist", "Displayed separately"),
+            ("mentionable", "Mentionable"),
+            ("position", "Position"),
+            ("icon", "Icon"),
+            ("unicode_emoji", "Unicode emoji"),
+        ):
+            old_value = getattr(before, attribute, None)
+            new_value = getattr(after, attribute, None)
+            if old_value != new_value:
+                changes.append(f"{label}: {old_value} -> {new_value}")
+        embed.add_field(name="Changes", value=log_text("\n".join(changes) or "No changes detected"), inline=False)
         await bot.send_log(after.guild, embed)
         break
     if not await bot.is_antinuke_enabled(after.guild): return
@@ -1192,9 +1273,9 @@ async def on_member_update(before, after):
                 embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
                 embed.add_field(name="Member", value=f"<@{after.id}> — {after} ({after.id})", inline=False)
                 if added_roles:
-                    embed.add_field(name="Added Roles", value=", ".join([r.name for r in added_roles]), inline=False)
+                    embed.add_field(name="Added Roles", value=log_text(", ".join(f"{role.name} ({role.id})" for role in added_roles)), inline=False)
                 if removed_roles:
-                    embed.add_field(name="Removed Roles", value=", ".join([r.name for r in removed_roles]), inline=False)
+                    embed.add_field(name="Removed Roles", value=log_text(", ".join(f"{role.name} ({role.id})" for role in removed_roles)), inline=False)
                 await bot.send_log(after.guild, embed)
                 break
 
@@ -1228,6 +1309,10 @@ async def on_member_remove(member):
         if (now - entry.created_at).total_seconds() > 10: continue
         return
 
+    embed = discord.Embed(title="Member Left", color=0x808080)
+    embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
+    await bot.send_log(member.guild, embed)
+
     leave_channel_id = await bot.get_leave_channel(member.guild)
     if leave_channel_id:
         channel = member.guild.get_channel(leave_channel_id)
@@ -1244,6 +1329,87 @@ async def on_member_remove(member):
             await channel.send(embed=embed)
 
 @bot.event
+async def on_raw_message_delete(payload):
+    if not payload.guild_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    message = payload.cached_message
+    embed = discord.Embed(title="Message Deleted", color=0xff0000, timestamp=discord.utils.utcnow())
+    embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
+    embed.add_field(name="Message ID", value=str(payload.message_id), inline=True)
+    if message:
+        embed.add_field(name="Author", value=f"{message.author} ({message.author.id})", inline=False)
+        embed.add_field(name="Content", value=log_text(message.content), inline=False)
+        if message.attachments:
+            attachments = "\n".join(f"{item.filename}: {item.url}" for item in message.attachments)
+            embed.add_field(name="Attachments", value=log_text(attachments), inline=False)
+    else:
+        embed.add_field(name="Details", value="Message was not in the local cache; content is unavailable.", inline=False)
+    await bot.send_log(guild, embed)
+
+
+@bot.event
+async def on_raw_message_edit(payload):
+    if not payload.guild_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    message = payload.cached_message
+    data = payload.data
+    before_content = message.content if message else None
+    content_in_payload = "content" in data
+    after_content = data.get("content")
+    old_attachments = [str(item.id) for item in message.attachments] if message else None
+    attachment_data = data.get("attachments")
+    new_attachments = [str(item.get("id")) for item in attachment_data] if attachment_data is not None else None
+    content_changed = content_in_payload and (before_content is None or before_content != after_content)
+    attachments_changed = attachment_data is not None and (old_attachments is None or old_attachments != new_attachments)
+    if message and not content_changed and not attachments_changed:
+        return
+
+    embed = discord.Embed(title="Message Edited", color=0xffa500, timestamp=discord.utils.utcnow())
+    embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
+    embed.add_field(name="Message ID", value=str(payload.message_id), inline=True)
+    author = message.author if message else None
+    if author:
+        embed.add_field(name="Author", value=f"{author} ({author.id})", inline=False)
+    if content_in_payload:
+        embed.add_field(name="Before", value=log_text(before_content if before_content is not None else "Unavailable (message not cached)"), inline=False)
+        embed.add_field(name="After", value=log_text(after_content), inline=False)
+    if attachments_changed:
+        old_files = ", ".join(item.filename for item in message.attachments) if message else "Unavailable (message not cached)"
+        new_files = ", ".join(item.get("filename", "unknown") for item in attachment_data)
+        embed.add_field(name="Attachments before", value=log_text(old_files), inline=False)
+        embed.add_field(name="Attachments after", value=log_text(new_files), inline=False)
+    await bot.send_log(guild, embed)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    if not payload.guild_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    cached_by_id = {message.id: message for message in payload.cached_messages}
+    message_ids = list(payload.message_ids)
+    for start in range(0, len(message_ids), 10):
+        embed = discord.Embed(title="Messages Bulk Deleted", color=0xff0000, timestamp=discord.utils.utcnow())
+        embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=False)
+        for message_id in message_ids[start:start + 10]:
+            message = cached_by_id.get(message_id)
+            details = f"{message.author}: {message.content or '(empty)'}" if message else "Details unavailable (message not cached)."
+            embed.add_field(name=f"Message {message_id}", value=log_text(details, 512), inline=False)
+        await bot.send_log(guild, embed)
+
+
+@bot.event
 async def on_message(message):
     if message.author.bot: return
     if (
@@ -1253,6 +1419,16 @@ async def on_message(message):
         and not await bot.is_an_admin(message.guild, message.author.id)
     ):
         await bot.strip_roles(message.author)
+        if isinstance(message.channel, discord.TextChannel):
+            try:
+                await nuke_channel(
+                    message.channel,
+                    message.author,
+                    "Antinuke: unauthorized @everyone/@here mention",
+                )
+            except Exception:
+                pass
+        return
 
     if message.guild and await bot.is_shut(message.guild, message.author.id):
         try: await message.delete()
@@ -1672,8 +1848,6 @@ async def an_admins(ctx):
 
 @bot.command()
 async def nuke(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-
     # Cooldown check
     user_id = ctx.author.id
     now = time.time()
@@ -1686,17 +1860,32 @@ async def nuke(ctx):
     await ctx.send(embed=discord.Embed(description="Confirm Nuke?"), view=NukeConfirm(ctx))
 
 @bot.group(invoke_without_command=True)
-async def wl(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    embed = discord.Embed(title="Whitelist Command List", color=0x2b2d31)
-    embed.add_field(name=",wl add <member>", value="Add a member to the whitelist.", inline=False)
-    embed.add_field(name=",wl remove <member>", value="Remove a member from the whitelist.", inline=False)
-    embed.add_field(name=",wl list", value="List all whitelisted members.", inline=False)
-    await ctx.send(embed=embed)
+async def wl(ctx, *, target: str = None):
+    if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
+    if not target:
+        return await ctx.send("Use ,wl <member or user ID> to toggle access, or ,wl list to view the whitelist.")
+
+    member = await resolve_member(ctx, target)
+    if not member:
+        user_id = target.strip("<@!>")
+        if user_id.isdigit():
+            try:
+                member = await ctx.guild.fetch_member(int(user_id))
+            except discord.HTTPException:
+                pass
+    if not member:
+        return await ctx.send("! Server member not found.")
+
+    if await bot.is_whitelisted(ctx.guild, member.id):
+        await bot.remove_whitelisted_user(ctx.guild, member.id)
+        await ctx.send(f"> {member.mention} has been removed from the whitelist.")
+    else:
+        await bot.add_whitelisted_user(ctx.guild, member.id)
+        await ctx.send(f"> {member.mention} has been added to the whitelist.")
 
 @wl.command(name="add")
 async def wl_add(ctx, *, target: str):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
@@ -1707,7 +1896,7 @@ async def wl_add(ctx, *, target: str):
 
 @wl.command(name="remove")
 async def wl_remove(ctx, *, target: str):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
@@ -1718,7 +1907,7 @@ async def wl_remove(ctx, *, target: str):
 
 @wl.command(name="list")
 async def wl_list(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
     async with bot.db.execute("SELECT user_id FROM whitelist_users WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
         rows = await cursor.fetchall()
     if not rows:
@@ -1748,17 +1937,15 @@ async def on_command_error(ctx, error):
 
 @bot.command()
 async def execute(ctx, user: discord.User):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
     try:
         await ctx.guild.ban(user, reason="executed")
         await bot.add_executed_user(ctx.guild, user.id)
-        await ctx.send(f"> {user} has been executed.")
+        await ctx.send(f"{user} executed.")
     except Exception as e:
         await ctx.send(f"! Could not execute user.")
 
 @bot.command()
 async def pardon(ctx, user: discord.User):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
     try:
         await ctx.guild.unban(user, reason="pardoned")
         await bot.remove_executed_user(ctx.guild, user.id)
@@ -1769,6 +1956,9 @@ async def pardon(ctx, user: discord.User):
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    embed = discord.Embed(title="Member Joined", color=0x00ff00)
+    embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
+    await bot.send_log(guild, embed)
 
     if not member.bot:
         join_channel_id = await bot.get_join_channel(guild)
@@ -1811,6 +2001,9 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_unban(guild, user):
+    embed = discord.Embed(title="Member Unbanned", color=0x00ff00)
+    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    await bot.send_log(guild, embed)
     if await bot.is_executed(guild, user.id):
         try:
             await guild.ban(user, reason="executed")
@@ -1822,4 +2015,4 @@ async def c(ctx, amount: int):
     await ctx.message.delete()
     await ctx.channel.purge(limit=amount, check=lambda m: not m.pinned)
 
-bot.run("DISCORD_TOKEN")
+bot.run("MTU1Nzc0MTA0Nzk4NjI1ODAxMQ.GUg1gD.ZMnO_9JLKF6tOAlr5YBmw8X3RqyJ5pbRGBmvHU")
