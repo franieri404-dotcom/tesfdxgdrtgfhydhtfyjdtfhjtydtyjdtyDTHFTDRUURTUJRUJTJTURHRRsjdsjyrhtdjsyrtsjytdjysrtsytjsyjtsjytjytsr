@@ -1,4 +1,3 @@
-import os
 import discord
 from discord.ext import commands
 import datetime
@@ -66,6 +65,7 @@ class AntiNukeBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS executed_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS join_channels (guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS leave_channels (guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS clean_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS autoresponder (guild_id INTEGER, trigger_text TEXT, response TEXT, PRIMARY KEY (guild_id, trigger_text))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS temp_snapshots (guild_id INTEGER PRIMARY KEY, snapshot_json TEXT NOT NULL)")
         await self.db.commit()
@@ -75,7 +75,7 @@ class AntiNukeBot(commands.Bot):
         await self.db.commit()
         
         self.loop.create_task(self.status_task())
-        print(f"France+zain bot active✌ | Logged in as: {self.user}")
+        print(f"zainn bot active✌ | Logged in as: {self.user}")
 
     async def status_task(self):
         await self.wait_until_ready()
@@ -140,6 +140,10 @@ class AntiNukeBot(commands.Bot):
 
     async def is_whitelisted(self, guild, user_id):
         async with self.db.execute("SELECT 1 FROM whitelist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def is_clean_channel(self, guild, channel_id):
+        async with self.db.execute("SELECT 1 FROM clean_channels WHERE guild_id = ? AND channel_id = ?", (guild.id, channel_id)) as cursor:
             return await cursor.fetchone() is not None
 
     async def is_executed(self, guild, user_id):
@@ -278,7 +282,7 @@ ANTINUKE_COMMAND_ROOTS = {
 }
 WHITELIST_REQUIRED_COMMANDS = {
     "shut", "unshut", "execute", "pardon", "bl", "dm", "logs", "colors",
-    "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp",
+    "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp", "clean",
 }
 
 
@@ -522,6 +526,7 @@ class HelpView(discord.ui.View):
             (",pardon <member>", "unban a executed user."),
             (",wl <member or ID>", "Toggle command whitelist access."),
             (",wl list", "List command-whitelisted members."),
+            (",clean", "Toggle whitelist-only chat in this channel."),
             (",logs", "Set logging."),
             (",colors", "color role panel."),
             (",pings", "ping role panel."),
@@ -807,6 +812,30 @@ async def help(ctx):
 async def logs(ctx):
     embed = discord.Embed(title="Enable Logging?", description="Do you want to enable logging in this channel?", color=0x2b2d31)
     await ctx.send(embed=embed, view=LogsConfirm(ctx))
+
+@bot.command()
+async def clean(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server channel.")
+
+    bot_member = ctx.guild.me
+    if bot_member is None or not ctx.channel.permissions_for(bot_member).manage_messages:
+        return await ctx.send("! I need Manage Messages permission to enable clean mode.")
+
+    if await bot.is_clean_channel(ctx.guild, ctx.channel.id):
+        await bot.db.execute(
+            "DELETE FROM clean_channels WHERE guild_id = ? AND channel_id = ?",
+            (ctx.guild.id, ctx.channel.id),
+        )
+        await bot.db.commit()
+        await ctx.send("Clean mode disabled.")
+    else:
+        await bot.db.execute(
+            "INSERT OR IGNORE INTO clean_channels (guild_id, channel_id) VALUES (?, ?)",
+            (ctx.guild.id, ctx.channel.id),
+        )
+        await bot.db.commit()
+        await ctx.send("Clean mode enabled.")
 
 @bot.command()
 async def colors(ctx):
@@ -1413,6 +1442,14 @@ async def on_raw_bulk_message_delete(payload):
 @bot.event
 async def on_message(message):
     if message.author.bot: return
+    if message.guild and await bot.is_clean_channel(message.guild, message.channel.id):
+        if not await bot.is_whitelisted(message.guild, message.author.id):
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            return
+
     if (
         message.guild
         and message.mention_everyone
@@ -2016,4 +2053,4 @@ async def c(ctx, amount: int):
     await ctx.message.delete()
     await ctx.channel.purge(limit=amount, check=lambda m: not m.pinned)
 
-bot.run(os.environ["DISCORD_TOKEN"])
+bot.run("MTU1Nzc0MTA0Nzk4NjI1ODAxMQ.GUg1gD.ZMnO_9JLKF6tOAlr5YBmw8X3RqyJ5pbRGBmvHU")
