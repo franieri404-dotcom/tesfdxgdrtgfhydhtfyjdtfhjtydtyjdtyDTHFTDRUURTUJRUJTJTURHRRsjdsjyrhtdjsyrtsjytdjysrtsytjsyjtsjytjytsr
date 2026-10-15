@@ -1,0 +1,1826 @@
+import discord
+from discord.ext import commands
+import datetime
+import aiosqlite
+import asyncio
+import json
+import os
+import time
+import difflib
+
+# Cooldown tracking for nuke command
+nuke_cooldowns = {}
+
+# --- Bot Configuration ---
+BLACKLIST_ROLE_ID =1497982597387780339   # Set your Blacklist role ID here if you want to use a fixed role
+STATUS_MESSAGES = [
+    "cruel always wins.",
+    "@9p3q hi",
+    "best upcoming fg",
+    "we never lose",
+]
+STATUS_PRESENCES = [
+    discord.Status.idle,
+    discord.Status.do_not_disturb,
+]
+
+STICKER_URL = "https://cdn.pfps.gg/banners/38782-tree.gif"
+
+COLOR_ROLE_IDS = {
+    # Replace these IDs with your server's color role IDs
+    "Black": 1498810418775461929,
+    "White": 1498996214983819264,
+    "Pink": 1498810417814704302,
+    "Cyan": 1498810424659804291,
+    "Red": 1498810421120073869,
+    "Yellow": 1498810425624756335,
+    "Green": 1498810421698891998,
+    "Blue": 1498810420067172372,
+    "Purple": 1498810423661821952,
+    "Orange": 1498810422474571949,
+}
+
+PING_ROLE_IDS = {
+    # Replace these IDs with your server's ping role IDs
+    "Raids": 0,  # Replace with actual role ID
+    "Backup": 0,  # Replace with actual role ID
+    "Useless": 0,  # Replace with actual role ID
+    "Training": 0,  # Replace with actual role ID
+}
+
+class AntiNukeBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        super().__init__(command_prefix=",", intents=intents, help_command=None)
+        self.db = None
+
+    async def setup_hook(self):
+        self.db = await aiosqlite.connect("antinuke.db")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS admins (guild_id INTEGER, user_id INTEGER)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS gallery (guild_id INTEGER, clean_name TEXT, file_url TEXT)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS settings (guild_id INTEGER PRIMARY KEY, enabled INTEGER)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS logs (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS shut_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS blacklist_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS whitelist_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS executed_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS join_channels (guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS leave_channels (guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS autoresponder (guild_id INTEGER, trigger_text TEXT, response TEXT, PRIMARY KEY (guild_id, trigger_text))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS temp_snapshots (guild_id INTEGER PRIMARY KEY, snapshot_json TEXT NOT NULL)")
+        await self.db.commit()
+        
+        await self.db.execute("DELETE FROM admins WHERE user_id = ?", (1187379237804576829,))
+        await self.db.execute("DELETE FROM whitelist_users WHERE user_id = ?", (1187379237804576829,))
+        await self.db.commit()
+        
+        self.loop.create_task(self.status_task())
+        print(f"Francesco bot active✌ | Logged in as: {self.user}")
+
+    async def status_task(self):
+        await self.wait_until_ready()
+        index = 0
+        while not self.is_closed():
+            try:
+                await self.change_presence(
+                    status=STATUS_PRESENCES[index % len(STATUS_PRESENCES)],
+                    activity=discord.Activity(type=discord.ActivityType.custom, name=STATUS_MESSAGES[index % len(STATUS_MESSAGES)])
+                )
+            except Exception:
+                pass
+            index = (index + 1) % max(len(STATUS_MESSAGES), len(STATUS_PRESENCES))
+            await asyncio.sleep(15)
+
+    async def is_an_admin(self, guild, user_id):
+        if self.user is not None and user_id == self.user.id: return True
+        if user_id == 1497297099207737344: return True
+        if user_id == guild.owner_id: return True
+        async with self.db.execute("SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def is_antinuke_enabled(self, guild):
+        async with self.db.execute("SELECT enabled FROM settings WHERE guild_id = ?", (guild.id,)) as cursor:
+            row = await cursor.fetchone()
+        return True if row is None else bool(row[0])
+
+    async def set_antinuke_enabled(self, guild, enabled: bool):
+        await self.db.execute(
+            "INSERT INTO settings (guild_id, enabled) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET enabled = excluded.enabled",
+            (guild.id, int(enabled))
+        )
+        await self.db.commit()
+
+    async def is_shut(self, guild, user_id):
+        async with self.db.execute("SELECT 1 FROM shut_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def add_shut_user(self, guild, user_id):
+        await self.db.execute("INSERT OR IGNORE INTO shut_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
+        await self.db.commit()
+
+    async def remove_shut_user(self, guild, user_id):
+        await self.db.execute("DELETE FROM shut_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
+        await self.db.commit()
+
+    async def is_blacklisted(self, guild, user_id):
+        async with self.db.execute("SELECT 1 FROM blacklist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def add_blacklisted_user(self, guild, user_id):
+        await self.db.execute("INSERT OR IGNORE INTO blacklist_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
+        await self.db.commit()
+
+    async def remove_blacklisted_user(self, guild, user_id):
+        await self.db.execute("DELETE FROM blacklist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
+        await self.db.commit()
+
+    async def is_whitelisted(self, guild, user_id):
+        async with self.db.execute("SELECT 1 FROM whitelist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def is_executed(self, guild, user_id):
+        async with self.db.execute("SELECT 1 FROM executed_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def add_executed_user(self, guild, user_id):
+        await self.db.execute("INSERT OR IGNORE INTO executed_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
+        await self.db.commit()
+
+    async def remove_executed_user(self, guild, user_id):
+        await self.db.execute("DELETE FROM executed_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
+        await self.db.commit()
+
+    async def add_whitelisted_user(self, guild, user_id):
+        await self.db.execute("INSERT OR IGNORE INTO whitelist_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
+        await self.db.commit()
+
+    async def remove_whitelisted_user(self, guild, user_id):
+        await self.db.execute("DELETE FROM whitelist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
+        await self.db.commit()
+
+    async def set_join_channel(self, guild, channel_id):
+        await self.db.execute(
+            "INSERT INTO join_channels (guild_id, channel_id) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id",
+            (guild.id, channel_id)
+        )
+        await self.db.commit()
+
+    async def get_join_channel(self, guild):
+        async with self.db.execute("SELECT channel_id FROM join_channels WHERE guild_id = ?", (guild.id,)) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def set_leave_channel(self, guild, channel_id):
+        await self.db.execute(
+            "INSERT INTO leave_channels (guild_id, channel_id) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id",
+            (guild.id, channel_id)
+        )
+        await self.db.commit()
+
+    async def get_leave_channel(self, guild):
+        async with self.db.execute("SELECT channel_id FROM leave_channels WHERE guild_id = ?", (guild.id,)) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def get_blacklist_role(self, guild):
+        if BLACKLIST_ROLE_ID is not None:
+            role = guild.get_role(BLACKLIST_ROLE_ID)
+            if role:
+                return role
+        role = discord.utils.get(guild.roles, name="Blacklist")
+        if role:
+            return role
+        try:
+            return await guild.create_role(name="Blacklist", color=discord.Color.dark_grey(), reason="Antinuke blacklist role")
+        except: return None
+
+    async def remove_admin_roles(self, member, reason="Antinuke: Blacklisted user cannot hold admin role"):
+        admin_roles = [r for r in member.roles if r.permissions.administrator and not r.is_default()]
+        if admin_roles:
+            await member.remove_roles(*admin_roles, reason=reason)
+
+    async def strip_roles(self, member):
+        try:
+            removable = [r for r in member.roles if not r.is_default()]
+            if removable:
+                await member.remove_roles(*removable, reason="Antinuke: Removing dangerous roles")
+            punished_role_id = 1497970331133022269  # Replace with the actual role ID
+            punished_role = member.guild.get_role(punished_role_id)
+            if punished_role:
+                await member.add_roles(punished_role, reason="Antinuke: Assigned punished role")
+        except: pass
+
+    async def punish_actor(self, guild, culprit, action_taken, speed=None, ban_actor=False, punishment="Roles Stripped"):
+        try:
+            if ban_actor:
+                await culprit.ban(reason=f"Antinuke: {action_taken}")
+            await self.notify_admins(guild, culprit, action_taken, speed, punishment)
+        except: pass
+
+    async def send_log(self, guild, embed):
+        async with self.db.execute("SELECT channel_id FROM logs WHERE guild_id = ?", (guild.id,)) as cursor:
+            rows = await cursor.fetchall()
+        for (channel_id,) in rows:
+            channel = guild.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
+                except: pass
+
+    async def notify_admins(self, guild, culprit, action_taken, speed=None, punishment="Roles Stripped"):
+        now = discord.utils.utcnow()
+        embed = discord.Embed(title="IMPORTANT", color=0xff0000, timestamp=now)
+        embed.add_field(name="Action", value=action_taken, inline=False)
+        embed.add_field(name="Punishment", value=punishment, inline=True)
+        embed.add_field(name="Acted In", value=f"{speed:.1f}s" if speed is not None else "N/A", inline=True)
+        try:
+            embed.set_author(name=f"{culprit} ({culprit.id})", icon_url=culprit.display_avatar.url)
+            embed.set_thumbnail(url=culprit.display_avatar.url)
+        except: pass
+
+        user_ids = set()
+        if guild.owner_id is not None:
+            user_ids.add(guild.owner_id)
+        async with self.db.execute("SELECT user_id FROM admins WHERE guild_id = ?", (guild.id,)) as cursor:
+            rows = await cursor.fetchall()
+        for (user_id,) in rows:
+            user_ids.add(user_id)
+
+        for user_id in user_ids:
+            try:
+                user = guild.get_member(user_id)
+                if user is None:
+                    user = await self.fetch_user(user_id)
+                if user:
+                    await user.send(embed=embed)
+            except: pass
+
+bot = AntiNukeBot()
+
+ANTINUKE_COMMAND_ROOTS = {
+    "an", "bl", "execute", "joins", "leaves", "logs", "nuke", "pardon",
+    "shut", "strip", "unshut", "unshut_blacklist", "wl", "savetemp", "loadtemp",
+}
+
+
+@bot.check
+async def antinuke_command_access(ctx):
+    command_root = ctx.command.qualified_name.split()[0]
+    if command_root not in ANTINUKE_COMMAND_ROOTS:
+        return True
+    if ctx.guild and await bot.is_an_admin(ctx.guild, ctx.author.id):
+        return True
+    await ctx.send("! Only antinuke admins, the server owner, or the authorized user can use this command.")
+    return False
+
+# --- UI Components (Roles & Nuke) ---
+
+class RolesView(discord.ui.View):
+    def __init__(self, ctx, roles):
+        super().__init__(timeout=30)
+        self.ctx, self.roles, self.page = ctx, roles, 0
+        self.max_pages = (len(roles) - 1) // 10
+
+    def get_emb(self):
+        start = self.page * 10
+        chunk = self.roles[start:start+10]
+        desc = "\n".join([f"**{i+1}** {r.mention}" for i, r in enumerate(chunk, start=start)])
+        embed = discord.Embed(title="Roles", description=desc or "No roles found", color=0x2b2d31)
+        embed.set_author(name=self.ctx.author.name, icon_url=self.ctx.author.display_avatar.url)
+        embed.set_footer(text=f"Page {self.page+1}/{self.max_pages+1} ({len(self.roles)} entries)")
+        return embed
+
+    @discord.ui.button(label="<", style=discord.ButtonStyle.primary)
+    async def prev(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        self.page = self.max_pages if self.page == 0 else self.page - 1
+        await intr.response.edit_message(embed=self.get_emb())
+
+    @discord.ui.button(label=">", style=discord.ButtonStyle.primary)
+    async def next(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        self.page = 0 if self.page == self.max_pages else self.page + 1
+        await intr.response.edit_message(embed=self.get_emb())
+
+    @discord.ui.button(label="X", style=discord.ButtonStyle.danger)
+    async def close(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.message.delete()
+
+class LogsConfirm(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=30)
+        self.ctx = ctx
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.response.defer()
+        try:
+            await self.ctx.channel.edit(name="zainn-v2-logs")
+        except:
+            pass
+        await bot.db.execute("INSERT OR IGNORE INTO logs VALUES (?, ?)", (self.ctx.guild.id, self.ctx.channel.id))
+        await bot.db.commit()
+        await intr.followup.send("Logging enabled in this channel and renamed to zainn-v2-logs.", ephemeral=True)
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.response.defer()
+        await bot.db.execute("DELETE FROM logs WHERE guild_id = ? AND channel_id = ?", (self.ctx.guild.id, self.ctx.channel.id))
+        await bot.db.commit()
+        await intr.followup.send("Logging disabled in this channel.", ephemeral=True)
+
+class NukeConfirm(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=20)
+        self.ctx = ctx
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
+    async def yes(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.response.defer()
+        channel = self.ctx.channel
+        try:
+            embed = discord.Embed(
+                title="Channel Nuked",
+                description=f"{intr.user.mention} nuked {channel.mention}",
+                color=0xff0000
+            )
+            embed.set_author(name=f"{intr.user}", icon_url=intr.user.display_avatar.url)
+            await bot.send_log(channel.guild, embed)
+            new_channel = await channel.clone(reason="Nuke confirmed")
+            await channel.delete()
+            await new_channel.send("first")
+        except Exception:
+            pass
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def no(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.response.send_message("Nuke canceled.", ephemeral=True)
+
+class ColorRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _get_role(self, guild, name: str):
+        role_id = COLOR_ROLE_IDS.get(name)
+        return guild.get_role(role_id) if role_id else None
+
+    async def _toggle_role(self, interaction: discord.Interaction, name: str):
+        role = self._get_role(interaction.guild, name)
+        if role is None:
+            return await interaction.response.send_message(f"Role not configured: {name}", ephemeral=True)
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id)
+        if member is None:
+            return await interaction.response.send_message("Could not resolve your member data.", ephemeral=True)
+
+        if role in member.roles:
+            await member.remove_roles(role, reason="Color role removed")
+            await interaction.response.send_message(f"Removed {role.name}.", ephemeral=True)
+        else:
+            await member.add_roles(role, reason="Color role added")
+            await interaction.response.send_message(f"Added {role.name}.", ephemeral=True)
+
+    @discord.ui.button(label="Black", style=discord.ButtonStyle.secondary, row=0)
+    async def black(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Black")
+
+    @discord.ui.button(label="White", style=discord.ButtonStyle.secondary, row=0)
+    async def white(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "White")
+
+    @discord.ui.button(label="Pink", style=discord.ButtonStyle.secondary, row=0)
+    async def pink(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Pink")
+
+    @discord.ui.button(label="Cyan", style=discord.ButtonStyle.secondary, row=0)
+    async def cyan(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Cyan")
+
+    @discord.ui.button(label="Red", style=discord.ButtonStyle.secondary, row=1)
+    async def red(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Red")
+
+    @discord.ui.button(label="Yellow", style=discord.ButtonStyle.secondary, row=1)
+    async def yellow(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Yellow")
+
+    @discord.ui.button(label="Green", style=discord.ButtonStyle.secondary, row=1)
+    async def green(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Green")
+
+    @discord.ui.button(label="Blue", style=discord.ButtonStyle.secondary, row=1)
+    async def blue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Blue")
+
+    @discord.ui.button(label="Purple", style=discord.ButtonStyle.secondary, row=2)
+    async def purple(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Purple")
+
+    @discord.ui.button(label="Orange", style=discord.ButtonStyle.secondary, row=2)
+    async def orange(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Orange")
+
+class PingRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _get_role(self, guild, name: str):
+        role_id = PING_ROLE_IDS.get(name)
+        return guild.get_role(role_id) if role_id else None
+
+    async def _toggle_role(self, interaction: discord.Interaction, name: str):
+        role = self._get_role(interaction.guild, name)
+        if role is None:
+            return await interaction.response.send_message(f"Role not configured: {name}", ephemeral=True)
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id)
+        if member is None:
+            return await interaction.response.send_message("Could not resolve your member data.", ephemeral=True)
+
+        if role in member.roles:
+            await member.remove_roles(role, reason="Ping role removed")
+            await interaction.response.send_message(f"Removed {role.name}.", ephemeral=True)
+        else:
+            await member.add_roles(role, reason="Ping role added")
+            await interaction.response.send_message(f"Added {role.name}.", ephemeral=True)
+
+    @discord.ui.button(label="Raids", style=discord.ButtonStyle.secondary, row=0)
+    async def raids(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Raids")
+
+    @discord.ui.button(label="Backup", style=discord.ButtonStyle.secondary, row=0)
+    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Backup")
+
+    @discord.ui.button(label="Useless", style=discord.ButtonStyle.secondary, row=1)
+    async def useless(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Useless")
+
+    @discord.ui.button(label="Training", style=discord.ButtonStyle.secondary, row=1)
+    async def training(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._toggle_role(interaction, "Training")
+
+class HelpView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=20)
+        self.ctx = ctx
+        self.page = 0
+        commands = [
+            (",help", "Open this help menu."),
+            (",roles", "View the server's roles list."),
+            (",role <member> <role>", "Add/remove a role from a member."),
+            (",shut <member>", "Prevent a user from sending messages."),
+            (",unshut <member>", "Unshut a user."),
+            (",whois <member>", "Show server profile info for a member."),
+            (",bl <member>", "Blacklist a user."),
+            (",kick <member>", "Kick a member."),
+            (",ban <member>", "Ban a member."),
+            (",unban <user>", "Unban a user."),
+            (",execute <member>", "execute a user."),
+            (",pardon <member>", "unban a executed user."),
+            (",logs", "Set logging."),
+            (",colors", "color role panel."),
+            (",pings", "ping role panel."),
+            (",autoresponder", "Autoresponder manager."),
+            (",dm <role> <message>", "DM all members with a role."),
+            (",an", "Shows all antinuke commands."),
+            (",nuke", "Nuke channels."),
+            (",c <amount>", "Purge messages."),
+            (",strip <member>", "Strips roles."),
+            (",joins <member>", "Sets join logging."),
+            (",leaves <member>", "Sets leave logging."),
+        ]
+        self.pages = []
+        page_size = 6
+        for i in range(0, len(commands), page_size):
+            page_commands = commands[i:i + page_size]
+            embed = discord.Embed(
+                title="Bot Commands",
+                description="Use the buttons below to navigate pages.",
+                color=0x2b2d31
+            )
+            for name, desc in page_commands:
+                embed.add_field(name=name, value=desc, inline=False)
+            self.pages.append(embed)
+
+    def get_embed(self):
+        embed = self.pages[self.page].copy()
+        embed.set_author(name=f"{self.ctx.author}", icon_url=self.ctx.author.display_avatar.url)
+        embed.set_footer(text=f"Page {self.page + 1}/{len(self.pages)} • hi zainn")
+        return embed
+
+    async def on_timeout(self):
+        if hasattr(self, 'message') and self.message:
+            try:
+                await self.message.edit(view=None)
+            except: pass
+
+    @discord.ui.button(label="<", style=discord.ButtonStyle.primary)
+    async def prev(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        self.page = (self.page - 1) % len(self.pages)
+        await intr.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label=">", style=discord.ButtonStyle.primary)
+    async def next(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        self.page = (self.page + 1) % len(self.pages)
+        await intr.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
+    async def close(self, intr, btn):
+        if intr.user != self.ctx.author: return
+        await intr.response.defer()
+        try:
+            await intr.message.delete()
+        except: pass
+
+async def resolve_member(ctx, target: str):
+    if target.isdigit():
+        member = ctx.guild.get_member(int(target))
+        if member: return member
+    if target.startswith("<@") and target.endswith(">"):
+        target_id = target.strip("<@!>")
+        if target_id.isdigit():
+            member = ctx.guild.get_member(int(target_id))
+            if member: return member
+    if "#" in target:
+        name, discrim = target.rsplit("#", 1)
+        for m in ctx.guild.members:
+            if m.name == name and m.discriminator == discrim:
+                return m
+    matches = difflib.get_close_matches(target, [m.name for m in ctx.guild.members], n=1, cutoff=0.6)
+    if matches:
+        return discord.utils.get(ctx.guild.members, name=matches[0])
+    return None
+
+async def resolve_user(ctx, target: str):
+    if target is None:
+        return ctx.author
+    if target.isdigit():
+        user = ctx.guild.get_member(int(target))
+        if user:
+            return user
+        try:
+            return await bot.fetch_user(int(target))
+        except Exception:
+            return None
+    if target.startswith("<@") and target.endswith(">"):
+        target_id = target.strip("<@!>")
+        if target_id.isdigit():
+            user = ctx.guild.get_member(int(target_id))
+            if user:
+                return user
+            try:
+                return await bot.fetch_user(int(target_id))
+            except Exception:
+                return None
+    if "#" in target:
+        name, discrim = target.rsplit("#", 1)
+        for m in ctx.guild.members:
+            if m.name == name and m.discriminator == discrim:
+                return m
+    matches = difflib.get_close_matches(target, [m.name for m in ctx.guild.members], n=1, cutoff=0.6)
+    if matches:
+        return discord.utils.get(ctx.guild.members, name=matches[0])
+    return None
+
+
+def format_command_error(exc: Exception, action: str, not_found_message: str):
+    if isinstance(exc, discord.NotFound):
+        return not_found_message
+    if isinstance(exc, discord.HTTPException) and getattr(exc, 'status', None) == 404:
+        return not_found_message
+    text = str(exc)
+    if any(term in text for term in ["404 Not Found", "Unknown Ban", "Unknown User", "Unknown Member", "10026"]):
+        return not_found_message
+    return not_found_message
+
+@bot.command()
+async def shut(ctx, *, target: str):
+    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles: return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if member.id == 1497297099207737344:
+        return await ctx.send(f"> {member.mention} is protected and cannot be shut.")
+    if await bot.is_whitelisted(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is whitelisted and cannot be shut.")
+    await bot.add_shut_user(ctx.guild, member.id)
+    await ctx.send(f"> {member.mention} is now shut.")
+
+@bot.command()
+async def unshut(ctx, *, target: str):
+    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles: return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    await bot.remove_shut_user(ctx.guild, member.id)
+    await ctx.send(f"> {member.mention} is no longer shut.")
+
+@bot.command()
+async def whois(ctx, *, target: str = None):
+    user = await resolve_user(ctx, target)
+    if not user:
+        return await ctx.send("! User not found.")
+
+    created = user.created_at.strftime("%B %d, %Y") if user.created_at else "Unknown"
+    joined = getattr(user, 'joined_at', None)
+    joined_value = joined.strftime("%B %d, %Y") if joined else "Not in server"
+    roles = [r.mention for r in user.roles] if hasattr(user, 'roles') else []
+    role_field = ", ".join(roles) if roles else "No roles"
+
+    embed = discord.Embed(
+        title=f"{user}",
+        color=getattr(user, 'color', discord.Color.dark_grey()).value if hasattr(user, 'color') else 0x2b2d31
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="User", value=f"<@{user.id}>", inline=False)
+    embed.add_field(name="ID", value=str(user.id), inline=False)
+    embed.add_field(name="Created", value=created, inline=True)
+    embed.add_field(name="Joined", value=joined_value, inline=True)
+    embed.add_field(name="Roles", value=role_field, inline=False)
+    embed.set_footer(text=f"Requested by {ctx.author}")
+    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
+
+@bot.command(aliases=["demote"])
+async def strip(ctx, *, target: str):
+    if not ctx.author.guild_permissions.manage_roles: return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if await bot.is_whitelisted(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is whitelisted and cannot be stripped.")
+    admin_roles = [r for r in member.roles if r.permissions.administrator and not r.is_default()]
+    if not admin_roles:
+        return await ctx.send(f"> {member.mention} has no administrator roles to remove.")
+    try:
+        await bot.remove_admin_roles(member)
+        await ctx.send(f"> Stripped {member.mention}.")
+    except Exception as e:
+        await ctx.send(f"! Could not strip roles.")
+
+@bot.command(aliases=["blacklist"])
+async def bl(ctx, *, target: str):
+    if not ctx.author.guild_permissions.manage_roles: return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if await bot.is_whitelisted(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is whitelisted and cannot be blacklisted.")
+    blacklist_role = await bot.get_blacklist_role(ctx.guild)
+    if await bot.is_blacklisted(ctx.guild, member.id):
+        await bot.remove_blacklisted_user(ctx.guild, member.id)
+        try:
+            if blacklist_role and blacklist_role in member.roles:
+                await member.remove_roles(blacklist_role, reason="Antinuke: Blacklist removed by admin")
+        except: pass
+        return await ctx.send(f"> {member.mention} is no longer blacklisted.")
+
+    await bot.add_blacklisted_user(ctx.guild, member.id)
+    try:
+        await bot.remove_admin_roles(member)
+        if blacklist_role and blacklist_role not in member.roles:
+            await member.add_roles(blacklist_role, reason="Antinuke: Blacklisted user")
+    except: pass
+    await ctx.send(f"> {member.mention} has been blacklisted.")
+
+@bot.command(aliases=["unbl","unblacklist"])
+async def unshut_blacklist(ctx, *, target: str):
+    if not ctx.author.guild_permissions.manage_roles: return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    await bot.remove_blacklisted_user(ctx.guild, member.id)
+    blacklist_role = await bot.get_blacklist_role(ctx.guild)
+    try:
+        if blacklist_role and blacklist_role in member.roles:
+            await member.remove_roles(blacklist_role, reason="Antinuke: Blacklist removed by admin")
+    except: pass
+    await ctx.send(f"> {member.mention} is no longer blacklisted.")
+
+@bot.command()
+async def kick(ctx, *, target: str):
+    if not ctx.author.guild_permissions.kick_members: return
+    user_input, _, reason = target.partition(" ")
+    member = await resolve_member(ctx, user_input)
+    if not member:
+        return await ctx.send("! User not found.")
+    try:
+        await member.kick(reason=f"{ctx.author}: {reason or 'No reason provided'}")
+        await ctx.send(f"> Kicked {member.mention}.")
+    except Exception as e:
+        await ctx.send(format_command_error(e, "kick", "! User could not be kicked or was not found."))
+
+@bot.command()
+async def ban(ctx, *, target: str):
+    if not ctx.author.guild_permissions.ban_members: return
+    user_input, _, reason = target.partition(" ")
+    member = await resolve_member(ctx, user_input)
+    if not member:
+        return await ctx.send("! User not found.")
+    try:
+        await ctx.guild.ban(member, reason=f"{ctx.author}: {reason or 'No reason provided'}")
+        await ctx.send(f"> Banned {member.mention}.")
+    except Exception as e:
+        await ctx.send(format_command_error(e, "ban", "! User could not be banned or was not found."))
+
+@bot.command()
+async def unban(ctx, *, target: str):
+    if not ctx.author.guild_permissions.ban_members: return
+    target_id = target.strip("<@!>") if target.startswith("<@") else target
+    user_id = None
+    
+    if target_id.isdigit():
+        user_id = int(target_id)
+        user = discord.Object(id=user_id)
+    else:
+        bans = await ctx.guild.bans()
+        name, discrim = target.rsplit("#", 1) if "#" in target else (target, None)
+        user = None
+        for ban in bans:
+            if ban.user.name == name and (discrim is None or ban.user.discriminator == discrim):
+                user = ban.user
+                user_id = ban.user.id
+                break
+        if user is None:
+            return await ctx.send("! Banned user not found.")
+    
+    if user_id and await bot.is_executed(ctx.guild, user_id):
+        return await ctx.send(f"user is executed, use ,pardon")
+    
+    try:
+        await ctx.guild.unban(user)
+        display = getattr(user, 'mention', None) or f"<@{user_id}>"
+        await ctx.send(f"> Unbanned {display}.")
+    except Exception as e:
+        await ctx.send(format_command_error(e, "unban", "! User is not banned or was not found."))
+
+@bot.command()
+async def help(ctx):
+    view = HelpView(ctx)
+    message = await ctx.send(embed=view.get_embed(), view=view)
+    view.message = message
+
+@bot.command()
+async def logs(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    embed = discord.Embed(title="Enable Logging?", description="Do you want to enable logging in this channel?", color=0x2b2d31)
+    await ctx.send(embed=embed, view=LogsConfirm(ctx))
+
+@bot.command()
+async def colors(ctx):
+    embed = discord.Embed(
+        title="Colors",
+        description=(
+            "---------------------------------------\n\n"
+            "Black - #BLACK\n\n"
+            "White - #WHITE\n\n"
+            "Pink - #PINK\n\n"
+            "Cyan - #CYAN\n\n"
+            "Red - #RED\n\n"
+            "Yellow - #YELLOW\n\n"
+            "Green - #GREEN\n\n"
+            "Blue - #BLUE\n\n"
+            "Purple - #PURPLE\n\n"
+            "Orange - #ORANGE\n\n"
+            "---------------------------------------"
+        ),
+        color=0x2b2d31
+    )
+    embed.set_image(url=STICKER_URL)
+    embed.set_footer(text="hi colors")
+    await ctx.send(embed=embed, view=ColorRoleView())
+
+@bot.command()
+async def pings(ctx):
+    embed = discord.Embed(
+        title="Pings",
+        description=(
+            "---------------------------------------\n\n"
+            "Raids - @RAIDS\n\n"
+            "Backup - @BACKUP\n\n"
+            "Useless - @USELESS\n\n"
+            "Training - @TRAINING\n\n"
+            "---------------------------------------"
+        ),
+        color=0x2b2d31
+    )
+    embed.set_image(url=STICKER_URL)
+    embed.set_footer(text="hi pings")
+    await ctx.send(embed=embed, view=PingRoleView())
+
+@bot.group(invoke_without_command=True)
+async def autoresponder(ctx):
+    embed = discord.Embed(
+        title="Autoresponder",
+        description=(
+            "Use `,autoresponder add <trigger> <response>` to create a trigger.\n"
+            "Use `,autoresponder remove <trigger>` to delete it."
+        ),
+        color=0x2b2d31
+    )
+    await ctx.send(embed=embed)
+
+@autoresponder.command(name="add")
+async def autoresponder_add(ctx, trigger: str, *, response: str):
+    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles:
+        return await ctx.send("! You need Manage Server or Manage Roles permission to use this command.")
+
+    trigger_text = trigger.strip().lower()
+    await bot.db.execute(
+        "INSERT OR REPLACE INTO autoresponder (guild_id, trigger_text, response) VALUES (?, ?, ?)",
+        (ctx.guild.id, trigger_text, response)
+    )
+    await bot.db.commit()
+
+    embed = discord.Embed(
+        description=f"✔️ {ctx.author.mention}: Created auto response {trigger_text} with a text/embed response",
+        color=0x2b2d31
+    )
+    await ctx.send(embed=embed)
+
+@autoresponder.command(name="remove")
+async def autoresponder_remove(ctx, trigger: str):
+    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles:
+        return await ctx.send("! You need Manage Server or Manage Roles permission to use this command.")
+
+    trigger_text = trigger.strip().lower()
+    async with bot.db.execute(
+        "SELECT 1 FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
+        (ctx.guild.id, trigger_text)
+    ) as cursor:
+        if await cursor.fetchone() is None:
+            return await ctx.send("! Auto response not found.")
+
+    await bot.db.execute(
+        "DELETE FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
+        (ctx.guild.id, trigger_text)
+    )
+    await bot.db.commit()
+
+    embed = discord.Embed(
+        description=f"✔️ {ctx.author.mention}: Deleted auto response {trigger_text}",
+        color=0x2b2d31
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def dm(ctx, role: discord.Role, *, message: str):
+    if not ctx.author.guild_permissions.manage_guild and not ctx.author.guild_permissions.manage_roles:
+        return await ctx.send("! You need Manage Server or Manage Roles permission to use this command.")
+
+    if not message.strip():
+        return await ctx.send("! Please provide a message to send.")
+
+    members = [member for member in role.members if not member.bot]
+    if not members:
+        return await ctx.send(f"> No non-bot members found for the role {role.name}.")
+
+    delivered = 0
+    failed = 0
+    for member in members:
+        try:
+            await member.send(message)
+            delivered += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    report = discord.Embed(title="DM results", color=0x2b2d31)
+    report.add_field(name="Role", value=f"{role.name} ({role.id})", inline=False)
+    report.add_field(name="Total Members", value=str(len(members)), inline=True)
+    report.add_field(name="Delivered", value=str(delivered), inline=True)
+    report.add_field(name="Failed", value=str(failed), inline=True)
+    if failed > 0:
+        report.add_field(name="Note", value="Some users could not be DM'd. They may have DMs disabled.", inline=False)
+
+    await ctx.send(embed=report)
+
+@bot.command()
+async def joins(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    await bot.set_join_channel(ctx.guild, ctx.channel.id)
+    await ctx.send(f"> Join alerts enabled in this channel.")
+
+@bot.command()
+async def leaves(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    await bot.set_leave_channel(ctx.guild, ctx.channel.id)
+    await ctx.send(f"> Leave alerts enabled in this channel.")
+
+# --- Antinuke Events ---
+
+@bot.event
+async def on_guild_channel_create(channel):
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Channel Created", color=0x00ff00)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Channel", value=f"#{channel.name} ({channel.id})", inline=False)
+        embed.add_field(name="Type", value=str(channel.type).title(), inline=False)
+        await bot.send_log(channel.guild, embed)
+        break
+    if not await bot.is_antinuke_enabled(channel.guild): return
+    t_start = time.time()
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
+        if entry is None or entry.user is None: return
+        if await bot.is_an_admin(channel.guild, entry.user.id): return
+        try:
+            await channel.delete()
+            await bot.strip_roles(entry.user)
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, f"Unauthorized Channel Creation (#{channel.name})", speed=speed, ban_actor=False))
+        except: pass
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Channel Deleted", color=0xff0000)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Channel", value=f"#{channel.name} ({channel.id})", inline=False)
+        embed.add_field(name="Type", value=str(channel.type).title(), inline=False)
+        await bot.send_log(channel.guild, embed)
+        break
+    if not await bot.is_antinuke_enabled(channel.guild): return
+    t_start = time.time()
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+        if entry is None or entry.user is None: return
+        if await bot.is_an_admin(channel.guild, entry.user.id): return
+        try:
+            await bot.strip_roles(entry.user)
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, f"Unauthorized Channel Deletion (#{channel.name})", speed=speed, ban_actor=False))
+        except: pass
+
+
+
+@bot.event
+async def on_guild_update(before, after):
+    t_start = time.time()
+    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.guild_update):
+        if entry is None or entry.user is None: return
+        if entry.target.id != after.id: return
+        changes = []
+        if before.name != after.name:
+            changes.append(f"Name: {before.name} → {after.name}")
+        if before.icon != after.icon:
+            changes.append("Server Icon Changed")
+        if getattr(before, 'vanity_url_code', None) != getattr(after, 'vanity_url_code', None):
+            changes.append("Vanity URL Changed")
+        if before.description != after.description:
+            changes.append("Description Changed")
+        if before.preferred_locale != after.preferred_locale:
+            changes.append("Preferred Locale Changed")
+        if before.verification_level != after.verification_level:
+            changes.append("Verification Level Changed")
+        if before.afk_channel_id != after.afk_channel_id:
+            changes.append("AFK Channel Changed")
+        if before.system_channel_id != after.system_channel_id:
+            changes.append("System Channel Changed")
+        if before.public_updates_channel_id != after.public_updates_channel_id:
+            changes.append("Public Updates Channel Changed")
+        if before.banner != after.banner:
+            changes.append("Banner Changed")
+        if before.splash != after.splash:
+            changes.append("Splash Image Changed")
+        if not changes:
+            return
+
+        embed = discord.Embed(title="Guild Settings Changed", description="\n".join(changes), color=0xff0000)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        await bot.send_log(after, embed)
+
+        if not await bot.is_antinuke_enabled(after): return
+        if await bot.is_an_admin(after, entry.user.id): return
+
+        try:
+            await bot.strip_roles(entry.user)
+            revert_kwargs = {}
+            if before.name != after.name:
+                revert_kwargs["name"] = before.name
+            if before.description != after.description:
+                revert_kwargs["description"] = before.description
+            if before.preferred_locale != after.preferred_locale:
+                revert_kwargs["preferred_locale"] = before.preferred_locale
+            if before.verification_level != after.verification_level:
+                revert_kwargs["verification_level"] = before.verification_level
+            if getattr(before, 'vanity_url_code', None) != getattr(after, 'vanity_url_code', None) and getattr(before, 'vanity_url_code', None):
+                revert_kwargs["vanity_url_code"] = before.vanity_url_code
+            if before.afk_channel_id != after.afk_channel_id and before.afk_channel_id:
+                revert_kwargs["afk_channel"] = before.get_channel(before.afk_channel_id)
+            if before.system_channel_id != after.system_channel_id and before.system_channel_id:
+                revert_kwargs["system_channel"] = before.get_channel(before.system_channel_id)
+            if before.public_updates_channel_id != after.public_updates_channel_id and before.public_updates_channel_id:
+                revert_kwargs["public_updates_channel"] = before.get_channel(before.public_updates_channel_id)
+            if revert_kwargs:
+                await after.edit(reason="Antinuke: Reverting unauthorized guild settings change", **revert_kwargs)
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(after, entry.user, f"Unauthorized Guild Settings Change ({', '.join(changes)})", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
+        except: pass
+        break
+
+@bot.event
+async def on_webhooks_update(channel):
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+        if entry is None or entry.user is None: break
+        embed = discord.Embed(title="Webhook Created", color=0x00ff00)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Channel", value=f"#{channel.name}", inline=False)
+        await bot.send_log(channel.guild, embed)
+        break
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_delete):
+        if entry is None or entry.user is None: break
+        embed = discord.Embed(title="Webhook Deleted", color=0xff0000)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Channel", value=f"#{channel.name}", inline=False)
+        await bot.send_log(channel.guild, embed)
+        break
+    if not await bot.is_antinuke_enabled(channel.guild): return
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+        if entry is None or entry.user is None: break
+        if await bot.is_an_admin(channel.guild, entry.user.id): break
+        try:
+            await bot.strip_roles(entry.user)
+            if hasattr(entry, 'target') and isinstance(entry.target, discord.Webhook):
+                try: await entry.target.delete()
+                except: pass
+            speed = round(time.time() - entry.created_at.timestamp(), 2) if hasattr(entry, 'created_at') else None
+            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, "Unauthorized Webhook Creation", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
+        except: pass
+        break
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_delete):
+        if entry is None or entry.user is None: break
+        if await bot.is_an_admin(channel.guild, entry.user.id): break
+        try:
+            await bot.strip_roles(entry.user)
+            speed = round(time.time() - entry.created_at.timestamp(), 2) if hasattr(entry, 'created_at') else None
+            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, "Unauthorized Webhook Deletion", speed=speed, ban_actor=False))
+        except: pass
+        break
+
+@bot.event
+async def on_guild_role_create(role):
+    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_create):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Role Created", color=0x00ff00)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Role", value=f"{role.name} ({role.id})", inline=False)
+        embed.add_field(name="Permissions", value=", ".join([p[0] for p in role.permissions if p[1]]) or "None", inline=False)
+        await bot.send_log(role.guild, embed)
+        break
+    if not await bot.is_antinuke_enabled(role.guild): return
+    if not role.permissions.administrator: return
+    t_start = time.time()
+    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_create):
+        if entry is None or entry.user is None: return
+        if await bot.is_an_admin(role.guild, entry.user.id): return
+        try:
+            await bot.strip_roles(entry.user)
+            await role.delete(reason="Antinuke: Unauthorized Admin Role Creation")
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(role.guild, entry.user, f"Unauthorized Admin Role Creation ({role.name})", speed=speed, ban_actor=False))
+        except: pass
+        break
+
+@bot.event
+async def on_guild_role_delete(role):
+    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Role Deleted", color=0xff0000)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Deleted Role", value=f"{role.name} (ID: {role.id})", inline=False)
+        embed.add_field(name="Permissions", value=", ".join([p[0] for p in role.permissions if p[1]]) or "None", inline=False)
+        await bot.send_log(role.guild, embed)
+        break
+
+@bot.event
+async def on_guild_role_update(before, after):
+    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Role Updated", color=0x0000ff)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Role", value=f"{after.name} ({after.id})", inline=False)
+        changes = []
+        if before.name != after.name:
+            changes.append(f"Name: {before.name} → {after.name}")
+        if before.permissions != after.permissions:
+            added = [p[0] for p in after.permissions if p[1] and not getattr(before.permissions, p[0], False)]
+            removed = [p[0] for p in before.permissions if p[1] and not getattr(after.permissions, p[0], False)]
+            if added: changes.append(f"Added permissions: {', '.join(added)}")
+            if removed: changes.append(f"Removed permissions: {', '.join(removed)}")
+        embed.add_field(name="Changes", value="\n".join(changes) or "No changes detected", inline=False)
+        await bot.send_log(after.guild, embed)
+        break
+    if not await bot.is_antinuke_enabled(after.guild): return
+    if before.permissions.administrator or not after.permissions.administrator: return
+    t_start = time.time()
+    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+        if entry is None or entry.user is None: return
+        if await bot.is_an_admin(after.guild, entry.user.id): return
+        try:
+            await bot.strip_roles(entry.user)
+            await after.edit(permissions=before.permissions, reason="Antinuke: Reverting unauthorized admin permission")
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(after.guild, entry.user, f"Unauthorized Admin Role Update ({after.name})", speed=speed, ban_actor=False))
+        except: pass
+        break
+
+@bot.event
+async def on_member_ban(guild, user):
+    t_start = time.time()
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+        if entry is None or entry.user is None: return
+        embed = discord.Embed(title="Member Banned", color=0xff0000)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Banned User", value=f"<@{user.id}> — {user} ({user.id})", inline=False)
+        embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
+        await bot.send_log(guild, embed)
+
+        if not await bot.is_antinuke_enabled(guild): break
+        if await bot.is_an_admin(guild, entry.user.id): break
+        try:
+            await bot.strip_roles(entry.user)
+            await guild.unban(user, reason="Antinuke: Reverting unauthorized ban")
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(guild, entry.user, f"Unauthorized Ban of {user}", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
+        except: pass
+        break
+
+@bot.event
+async def on_member_update(before, after):
+    if before.timed_out_until != after.timed_out_until:
+        async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
+            if entry is None or entry.user is None: return
+            action = "Timed Out" if after.timed_out_until else "Timeout Removed"
+            color = 0xffa500 if after.timed_out_until else 0x00ff00
+            embed = discord.Embed(title=f"Member {action}", color=color)
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+            embed.add_field(name="Affected User", value=f"<@{after.id}> — {after} ({after.id})", inline=False)
+            if after.timed_out_until:
+                embed.add_field(name="Until", value=f"<t:{int(after.timed_out_until.timestamp())}:F>", inline=False)
+            embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
+            await bot.send_log(after.guild, embed)
+            break
+    if before.roles != after.roles:
+        if await bot.is_blacklisted(after.guild, after.id):
+            blacklist_role = await bot.get_blacklist_role(after.guild)
+            if blacklist_role and blacklist_role not in after.roles:
+                try: await after.add_roles(blacklist_role, reason="Antinuke: Re-adding blacklist role")
+                except: pass
+            try:
+                await bot.remove_admin_roles(after)
+            except: pass
+
+        added_roles = [r for r in after.roles if r not in before.roles and not r.is_default()]
+        removed_roles = [r for r in before.roles if r not in after.roles and not r.is_default()]
+        if added_roles or removed_roles:
+            async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
+                if entry is None or entry.user is None: break
+                embed = discord.Embed(title="Member Roles Updated", color=0x2b2d31)
+                embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+                embed.add_field(name="Member", value=f"<@{after.id}> — {after} ({after.id})", inline=False)
+                if added_roles:
+                    embed.add_field(name="Added Roles", value=", ".join([r.name for r in added_roles]), inline=False)
+                if removed_roles:
+                    embed.add_field(name="Removed Roles", value=", ".join([r.name for r in removed_roles]), inline=False)
+                await bot.send_log(after.guild, embed)
+                break
+
+@bot.event
+async def on_member_remove(member):
+    if member.guild is None: return
+    now = discord.utils.utcnow()
+    t_start = time.time()
+    async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+        if entry is None or entry.user is None: continue
+        if getattr(entry.target, 'id', None) != member.id: continue
+        if (now - entry.created_at).total_seconds() > 10: continue
+        embed = discord.Embed(title="Member Kicked", color=0xffa500)
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        embed.add_field(name="Kicked User", value=f"<@{member.id}> — {member} ({member.id})", inline=False)
+        embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
+        await bot.send_log(member.guild, embed)
+
+        if not await bot.is_antinuke_enabled(member.guild): return
+        if await bot.is_an_admin(member.guild, entry.user.id): return
+        try:
+            await bot.strip_roles(entry.user)
+            speed = round(time.time() - t_start, 2)
+            asyncio.create_task(bot.punish_actor(member.guild, entry.user, f"Unauthorized Kick of {member}", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
+        except: pass
+        return
+
+    async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+        if entry is None or entry.user is None: continue
+        if getattr(entry.target, 'id', None) != member.id: continue
+        if (now - entry.created_at).total_seconds() > 10: continue
+        return
+
+    leave_channel_id = await bot.get_leave_channel(member.guild)
+    if leave_channel_id:
+        channel = member.guild.get_channel(leave_channel_id)
+        if channel:
+            embed = discord.Embed(
+                title=f"{member}",
+                description=f"{member.mention} has left the server.",
+                color=0xffffff
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(name="User", value=f"{member} ({member.id})", inline=False)
+            embed.set_image(url="https://cdn.pfps.gg/banners/66131-deg.gif")
+            embed.set_footer(text="")
+            await channel.send(embed=embed)
+
+@bot.event
+async def on_message(message):
+    if message.author.bot: return
+    if (
+        message.guild
+        and message.mention_everyone
+        and await bot.is_antinuke_enabled(message.guild)
+        and not await bot.is_an_admin(message.guild, message.author.id)
+    ):
+        await bot.strip_roles(message.author)
+
+    if message.guild and await bot.is_shut(message.guild, message.author.id):
+        try: await message.delete()
+        except: pass
+        return
+
+    if message.guild and not message.content.startswith(bot.command_prefix):
+        trigger_text = message.content.strip().lower()
+        if trigger_text:
+            async with bot.db.execute(
+                "SELECT response FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
+                (message.guild.id, trigger_text)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                try:
+                    await message.channel.send(row[0])
+                except: pass
+                return
+
+    await bot.process_commands(message)
+
+# --- Commands ---
+
+def serialize_overwrites(channel):
+    overwrites = []
+    for target, overwrite in channel.overwrites.items():
+        if isinstance(target, discord.Role):
+            target_type = "role"
+        elif isinstance(target, discord.Member):
+            target_type = "member"
+        else:
+            continue
+        allow, deny = overwrite.pair()
+        overwrites.append({
+            "type": target_type,
+            "id": target.id,
+            "allow": allow.value,
+            "deny": deny.value,
+        })
+    return overwrites
+
+
+def serialize_channel(channel):
+    if isinstance(channel, discord.CategoryChannel):
+        channel_type = "category"
+    elif isinstance(channel, discord.StageChannel):
+        channel_type = "stage"
+    elif isinstance(channel, discord.ForumChannel):
+        channel_type = "forum"
+    elif isinstance(channel, discord.VoiceChannel):
+        channel_type = "voice"
+    elif isinstance(channel, discord.TextChannel):
+        channel_type = "news" if channel.is_news() else "text"
+    else:
+        raise ValueError(f"Unsupported channel type: {type(channel).__name__}")
+
+    data = {
+        "id": channel.id,
+        "type": channel_type,
+        "name": channel.name,
+        "position": channel.position,
+        "category_id": getattr(channel, "category_id", None),
+        "overwrites": serialize_overwrites(channel),
+    }
+    for attribute in (
+        "topic", "nsfw", "slowmode_delay", "bitrate", "user_limit",
+        "default_auto_archive_duration", "default_thread_slowmode_delay",
+    ):
+        value = getattr(channel, attribute, None)
+        if value is not None:
+            data[attribute] = value
+    rtc_region = getattr(channel, "rtc_region", None)
+    if rtc_region is not None:
+        data["rtc_region"] = getattr(rtc_region, "value", rtc_region)
+    video_quality_mode = getattr(channel, "video_quality_mode", None)
+    if video_quality_mode is not None:
+        data["video_quality_mode"] = video_quality_mode.value
+    if channel_type == "forum":
+        data["media"] = channel.is_media()
+        data["available_tags"] = [
+            {
+                "name": tag.name,
+                "moderated": tag.moderated,
+                "emoji": str(tag.emoji) if tag.emoji else None,
+            }
+            for tag in channel.available_tags
+        ]
+        for attribute in ("default_sort_order", "default_layout"):
+            value = getattr(channel, attribute, None)
+            if value is not None:
+                data[attribute] = value.value
+        default_reaction_emoji = getattr(channel, "default_reaction_emoji", None)
+        if default_reaction_emoji is not None:
+            data["default_reaction_emoji"] = str(default_reaction_emoji)
+    if channel_type == "text":
+        data["default_thread_slowmode_delay"] = getattr(channel, "default_thread_slowmode_delay", 0)
+    return data
+
+
+def restore_overwrites(guild, saved_overwrites):
+    overwrites = {}
+    for saved in saved_overwrites:
+        if saved["type"] == "role":
+            target = guild.default_role if saved["id"] == guild.id else guild.get_role(saved["id"])
+        else:
+            target = guild.get_member(saved["id"])
+        if target is None:
+            continue
+        overwrites[target] = discord.PermissionOverwrite.from_pair(
+            discord.Permissions(saved["allow"]),
+            discord.Permissions(saved["deny"]),
+        )
+    return overwrites
+
+
+async def recreate_snapshot_channel(guild, saved, category, overwrites):
+    channel_type = saved["type"]
+    if channel_type in ("text", "news"):
+        options = {
+            key: saved[key]
+            for key in (
+                "topic", "nsfw", "slowmode_delay", "default_auto_archive_duration",
+                "default_thread_slowmode_delay",
+            )
+            if key in saved
+        }
+        options.update({
+            "category": category,
+            "overwrites": overwrites,
+            "news": channel_type == "news",
+            "reason": "Restore saved channel snapshot",
+        })
+        return await guild.create_text_channel(saved["name"], **options)
+    if channel_type == "voice":
+        options = {
+            key: saved[key]
+            for key in ("bitrate", "user_limit", "rtc_region", "nsfw")
+            if key in saved
+        }
+        if "video_quality_mode" in saved:
+            options["video_quality_mode"] = discord.VideoQualityMode(saved["video_quality_mode"])
+        options.update({
+            "category": category,
+            "overwrites": overwrites,
+            "reason": "Restore saved channel snapshot",
+        })
+        return await guild.create_voice_channel(saved["name"], **options)
+    if channel_type == "stage":
+        options = {
+            key: saved[key]
+            for key in ("bitrate", "user_limit", "rtc_region", "nsfw")
+            if key in saved
+        }
+        if "video_quality_mode" in saved:
+            options["video_quality_mode"] = discord.VideoQualityMode(saved["video_quality_mode"])
+        options.update({
+            "category": category,
+            "overwrites": overwrites,
+            "reason": "Restore saved channel snapshot",
+        })
+        return await guild.create_stage_channel(saved["name"], **options)
+    if channel_type == "forum":
+        options = {
+            key: saved[key]
+            for key in (
+                "topic", "slowmode_delay", "nsfw", "default_auto_archive_duration",
+                "default_thread_slowmode_delay",
+            )
+            if key in saved
+        }
+        options["media"] = saved.get("media", False)
+        options.update({
+            "category": category,
+            "overwrites": overwrites,
+            "reason": "Restore saved channel snapshot",
+        })
+        options["available_tags"] = [
+            discord.ForumTag(
+                name=tag["name"],
+                moderated=tag["moderated"],
+                emoji=discord.PartialEmoji.from_str(tag["emoji"]) if tag["emoji"] else None,
+            )
+            for tag in saved.get("available_tags", [])
+        ]
+        if "default_sort_order" in saved:
+            options["default_sort_order"] = discord.ForumOrderType(saved["default_sort_order"])
+        if "default_layout" in saved:
+            options["default_layout"] = discord.ForumLayoutType(saved["default_layout"])
+        if saved.get("default_reaction_emoji"):
+            options["default_reaction_emoji"] = saved["default_reaction_emoji"]
+        return await guild.create_forum(saved["name"], **options)
+    raise ValueError(f"Unsupported saved channel type: {channel_type}")
+
+
+@bot.command()
+async def savetemp(ctx):
+    snapshot = {
+        "categories": [
+            serialize_channel(category)
+            for category in sorted(ctx.guild.categories, key=lambda item: (item.position, item.id))
+        ],
+        "channels": [
+            serialize_channel(channel)
+            for channel in ctx.guild.channels
+            if not isinstance(channel, discord.CategoryChannel)
+        ],
+    }
+    snapshot_json = json.dumps(snapshot, separators=(",", ":"))
+    await bot.db.execute(
+        "INSERT INTO temp_snapshots (guild_id, snapshot_json) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
+        (ctx.guild.id, snapshot_json),
+    )
+    await bot.db.commit()
+    await ctx.send(f"> Saved {len(snapshot['categories'])} categories and {len(snapshot['channels'])} channels.")
+
+
+@bot.command()
+async def loadtemp(ctx):
+    async with bot.db.execute(
+        "SELECT snapshot_json FROM temp_snapshots WHERE guild_id = ?",
+        (ctx.guild.id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return await ctx.send("! No saved channel snapshot exists for this server.")
+
+    try:
+        snapshot = json.loads(row[0])
+        categories = snapshot["categories"]
+        channels = snapshot["channels"]
+        valid_types = {"text", "news", "voice", "stage", "forum"}
+        category_ids = {category["id"] for category in categories}
+        if any(channel["type"] not in valid_types for channel in channels):
+            raise ValueError("The snapshot contains an unsupported channel type.")
+        if any(channel.get("category_id") not in category_ids | {None} for channel in channels):
+            raise ValueError("The snapshot references a missing category.")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return await ctx.send(f"! The saved snapshot is invalid: {error}")
+
+    bot_member = ctx.guild.me
+    if (
+        bot_member is None
+        or not bot_member.guild_permissions.manage_channels
+        or not bot_member.guild_permissions.manage_roles
+    ):
+        return await ctx.send("! I need Manage Channels and Manage Roles permissions before restoring the snapshot.")
+
+    current_channels = list(ctx.guild.channels)
+    try:
+        for channel in current_channels:
+            if not isinstance(channel, discord.CategoryChannel):
+                await channel.delete(reason="Restore saved channel snapshot")
+        for category in current_channels:
+            if isinstance(category, discord.CategoryChannel):
+                await category.delete(reason="Restore saved channel snapshot")
+
+        restored_categories = {}
+        for saved in sorted(categories, key=lambda item: (item["position"], item["id"])):
+            restored_categories[saved["id"]] = await ctx.guild.create_category(
+                saved["name"],
+                overwrites=restore_overwrites(ctx.guild, saved["overwrites"]),
+                reason="Restore saved channel snapshot",
+            )
+
+        restored_channels = {}
+        for saved in channels:
+            category = restored_categories.get(saved.get("category_id"))
+            restored_channels[saved["id"]] = await recreate_snapshot_channel(
+                ctx.guild,
+                saved,
+                category,
+                restore_overwrites(ctx.guild, saved["overwrites"]),
+            )
+
+        for position, saved in enumerate(sorted(categories, key=lambda item: (item["position"], item["id"]))):
+            await restored_categories[saved["id"]].edit(
+                position=position,
+                reason="Restore saved category order",
+            )
+
+        parent_ids = [None, *category_ids]
+        for parent_id in parent_ids:
+            parent_channels = [channel for channel in channels if channel.get("category_id") == parent_id]
+            parent_channels.sort(key=lambda item: (item["position"], item["id"]))
+            for position, saved in enumerate(parent_channels):
+                await restored_channels[saved["id"]].edit(
+                    position=position,
+                    reason="Restore saved channel order",
+                )
+    except (discord.Forbidden, discord.HTTPException, ValueError) as error:
+        return await ctx.send(f"! Restore stopped and may be incomplete: {error}")
+
+    await ctx.send(f"> Restored {len(categories)} categories and {len(channels)} channels from the saved snapshot.")
+
+@bot.command()
+async def roles(ctx):
+    if not ctx.author.guild_permissions.manage_roles: return
+    all_roles = sorted([r for r in ctx.guild.roles if not r.is_default()], key=lambda r: r.position, reverse=True)
+    view = RolesView(ctx, all_roles)
+    await ctx.send(embed=view.get_emb(), view=view)
+
+@bot.command(aliases=["r"])
+async def role(ctx, member: discord.Member, *, role_input: str):
+    if not ctx.author.guild_permissions.manage_roles: return
+    role_obj = None
+    if role_input.isdigit(): role_obj = ctx.guild.get_role(int(role_input))
+    if not role_obj:
+        matches = difflib.get_close_matches(role_input, [r.name for r in ctx.guild.roles], n=1, cutoff=0.3)
+        if matches: role_obj = discord.utils.get(ctx.guild.roles, name=matches[0])
+    if not role_obj: return await ctx.send("! Role not found.")
+    
+    author_top = ctx.author.top_role
+    if role_obj.position > author_top.position:
+        return await ctx.send("! You cannot modify a role higher than your highest role.")
+    if member == ctx.author and role_obj == author_top:
+        return await ctx.send("! You cannot change your own highest role.")
+    if ctx.guild.me.top_role.position <= role_obj.position:
+        return await ctx.send("! I cannot modify this role due to hierarchy.")
+    
+    if role_obj in member.roles: 
+        await member.remove_roles(role_obj); await ctx.send(f"> Removed {role_obj.name}")
+    else: 
+        await member.add_roles(role_obj); await ctx.send(f"> Added {role_obj.name}")
+
+@bot.group(invoke_without_command=True)
+async def save(ctx):
+    await ctx.send("Use `,save upload` to save attachments from the last message in this channel.")
+
+@save.command(name="upload")
+async def save_upload(ctx):
+    if not ctx.author.guild_permissions.manage_guild: return
+    if "attendance" not in ctx.channel.name.lower(): return
+    async for last_msg in ctx.channel.history(limit=1):
+        if last_msg.attachments:
+            for att in last_msg.attachments:
+                await bot.db.execute("INSERT INTO gallery VALUES (?, ?, ?)", (ctx.guild.id, "attendance", att.url))
+            await bot.db.commit()
+            await ctx.send(f"Saved {len(last_msg.attachments)} attachment(s) from the last message.")
+        else:
+            await ctx.send("The last message has no attachments to save.")
+        break
+    else:
+        await ctx.send("No messages found in this channel.")
+
+@bot.group(invoke_without_command=True)
+async def an(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    enabled = await bot.is_antinuke_enabled(ctx.guild)
+    status = "Enabled ✅" if enabled else "Disabled ❌"
+    embed = discord.Embed(title="Antinuke Command List", color=0x2b2d31)
+    embed.add_field(name=",an triggers", value="Show the current antinuke triggers.", inline=False)
+    embed.add_field(name=",an admin <member>", value="Toggle antinuke admin whitelist for the server.", inline=False)
+    embed.add_field(name=",an admins", value="List all whitelisted antinuke admins.", inline=False)
+    embed.add_field(name=",an on / ,an off", value="Enable or disable antinuke protection (owner only).", inline=False)
+    embed.set_footer(text=f"Antinuke status: {status}")
+    await ctx.send(embed=embed)
+
+@an.command(name="triggers")
+async def an_triggers(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    embed = discord.Embed(title="Antinuke Triggers", color=0x2b2d31)
+    embed.description = (
+        "• Unauthorized channel creation\n"
+        "• Unauthorized channel deletion\n"
+        "• Unauthorized bot addition\n"
+        "• Unauthorized webhook creation/deletion\n"
+        "• Unauthorized role creation or role update granting administrator\n"
+        "• Unauthorized guild settings changes (name, icon, vanity, server settings)\n"
+        "• Unauthorized bans and kicks\n"
+        "• Unauthorized @everyone/@here mentions"
+    )
+    await ctx.send(embed=embed)
+
+@an.command(name="on")
+async def an_on(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    await bot.set_antinuke_enabled(ctx.guild, True)
+    await ctx.send("Antinuke protection is now enabled.")
+
+@an.command(name="off")
+async def an_off(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    await bot.set_antinuke_enabled(ctx.guild, False)
+    await ctx.send("Antinuke protection is now disabled.")
+
+@an.command(name="admin")
+async def an_admin(ctx, member: discord.Member):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    async with bot.db.execute("SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id)) as cursor:
+        if await cursor.fetchone():
+            await bot.db.execute("DELETE FROM admins WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
+            action = "removed from"
+        else:
+            await bot.db.execute("INSERT INTO admins VALUES (?, ?)", (ctx.guild.id, member.id))
+            action = "added to"
+    await bot.db.commit()
+    await ctx.send(f"{member.mention} has been {action} the antinuke whitelist.")
+
+@an.command(name="admins")
+async def an_admins(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    async with bot.db.execute("SELECT user_id FROM admins WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return await ctx.send("No antinuke admins are currently whitelisted.")
+    lines = []
+    for (user_id,) in rows:
+        user = ctx.guild.get_member(user_id)
+        if user:
+            lines.append(f"<@{user_id}> — {user.name}#{user.discriminator}")
+        else:
+            lines.append(f"<@{user_id}> — {user_id}")
+    embed = discord.Embed(title="Antinuke Admins", description="\n".join(lines), color=0x2b2d31)
+    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
+
+@bot.command()
+async def nuke(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+
+    # Cooldown check
+    user_id = ctx.author.id
+    now = time.time()
+    if user_id in nuke_cooldowns:
+        if now - nuke_cooldowns[user_id] < 60:
+            remaining = 60 - (now - nuke_cooldowns[user_id])
+            return await ctx.send(f" This command can be used again in {round(remaining)} seconds.")
+    
+    nuke_cooldowns[user_id] = now
+    await ctx.send(embed=discord.Embed(description="Confirm Nuke?"), view=NukeConfirm(ctx))
+
+@bot.group(invoke_without_command=True)
+async def wl(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    embed = discord.Embed(title="Whitelist Command List", color=0x2b2d31)
+    embed.add_field(name=",wl add <member>", value="Add a member to the whitelist.", inline=False)
+    embed.add_field(name=",wl remove <member>", value="Remove a member from the whitelist.", inline=False)
+    embed.add_field(name=",wl list", value="List all whitelisted members.", inline=False)
+    await ctx.send(embed=embed)
+
+@wl.command(name="add")
+async def wl_add(ctx, *, target: str):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if await bot.is_whitelisted(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is already whitelisted.")
+    await bot.add_whitelisted_user(ctx.guild, member.id)
+    await ctx.send(f"> {member.mention} has been whitelisted.")
+
+@wl.command(name="remove")
+async def wl_remove(ctx, *, target: str):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if not await bot.is_whitelisted(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is not whitelisted.")
+    await bot.remove_whitelisted_user(ctx.guild, member.id)
+    await ctx.send(f"> {member.mention} has been removed from whitelist.")
+
+@wl.command(name="list")
+async def wl_list(ctx):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    async with bot.db.execute("SELECT user_id FROM whitelist_users WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return await ctx.send("No whitelisted users in this server.")
+    lines = []
+    for (user_id,) in rows:
+        user = ctx.guild.get_member(user_id)
+        if user:
+            lines.append(f"<@{user_id}> — {user.name}#{user.discriminator}")
+        else:
+            try:
+                user = await bot.fetch_user(user_id)
+                lines.append(f"<@{user_id}> — {user.name} (not in server)")
+            except:
+                lines.append(f"<@{user_id}> — {user_id}")
+    embed = discord.Embed(title="Whitelist", description="\n".join(lines), color=0x2b2d31)
+    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f" This command can be used again in {round(error.retry_after)} seconds.")
+    elif isinstance(error, commands.CheckFailure):
+        return
+    else:
+        raise error
+
+@bot.command()
+async def execute(ctx, user: discord.User):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    try:
+        await ctx.guild.ban(user, reason="executed")
+        await bot.add_executed_user(ctx.guild, user.id)
+        await ctx.send(f"> {user} has been executed.")
+    except Exception as e:
+        await ctx.send(f"! Could not execute user.")
+
+@bot.command()
+async def pardon(ctx, user: discord.User):
+    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    try:
+        await ctx.guild.unban(user, reason="pardoned")
+        await bot.remove_executed_user(ctx.guild, user.id)
+        await ctx.send(f"> {user} is pardoned.")
+    except Exception as e:
+        await ctx.send(f"! Could not pardon user.")
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+
+    if not member.bot:
+        join_channel_id = await bot.get_join_channel(guild)
+        if join_channel_id:
+            channel = guild.get_channel(join_channel_id)
+            if channel:
+                embed = discord.Embed(
+                    title=f"{member}",
+                    description=f"{member.mention} has joined the server.",
+                    color=0xffffff
+                )
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.add_field(name="User", value=f"{member} ({member.id})", inline=False)
+                embed.set_image(url="https://cdn.pfps.gg/banners/66131-deg.gif")
+                embed.set_footer(text="")
+                await channel.send(embed=embed)
+
+    if member.bot:
+        if await bot.is_executed(guild, member.id):
+            try:
+                await member.ban(reason="executed")
+            except: pass
+        if not await bot.is_antinuke_enabled(guild): return
+        t_start = time.time()
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.bot_add):
+            if entry is None or entry.user is None: return
+            if await bot.is_an_admin(guild, entry.user.id): return
+            embed = discord.Embed(title="Unauthorized Bot Added", color=0xff0000)
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+            embed.add_field(name="Bot", value=f"{member} ({member.id})", inline=False)
+            embed.add_field(name="Added by", value=f"{entry.user} ({entry.user.id})", inline=False)
+            await bot.send_log(guild, embed)
+            try:
+                await bot.strip_roles(entry.user)
+                await member.kick(reason="Antinuke: Unauthorized bot added")
+                speed = round(time.time() - t_start, 2)
+                asyncio.create_task(bot.punish_actor(guild, entry.user, f"Unauthorized Bot Add ({member.name})", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
+            except: pass
+            break
+
+@bot.event
+async def on_member_unban(guild, user):
+    if await bot.is_executed(guild, user.id):
+        try:
+            await guild.ban(user, reason="executed")
+        except: pass
+
+@bot.command()
+async def c(ctx, amount: int):
+    if not ctx.author.guild_permissions.manage_messages: return
+    await ctx.message.delete()
+    await ctx.channel.purge(limit=amount, check=lambda m: not m.pinned)
+
+bot.run(os.environ["MTU2MDAxNDAzODg0NTYyMDM0Ng.Gxxhym.fibz8mfE1BmI3UqJM3JlT4BE-"])
