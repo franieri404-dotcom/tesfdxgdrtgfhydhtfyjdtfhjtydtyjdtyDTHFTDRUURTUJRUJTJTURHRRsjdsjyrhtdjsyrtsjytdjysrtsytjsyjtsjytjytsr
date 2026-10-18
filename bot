@@ -1,26 +1,48 @@
+
+import datetime
+import asyncio
+import logging
+import json
+import difflib
+import getpass
+import os
+import sys
+import time
+from pathlib import Path
+
+import aiosqlite
 import discord
 from discord.ext import commands
-import datetime
-import aiosqlite
-import asyncio
-import json
-import time
-import difflib
 
-# Cooldown tracking for nuke command
-nuke_cooldowns = {}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("antinuke")
+
+command_cooldowns = {}
+COMMAND_COOLDOWN_SECONDS = 3
+BAN_WINDOW_SECONDS = 10
+AUDIT_LOG_EVENT_TIMEOUT_SECONDS = 1.5
+AUDIT_LOG_ENTRY_TTL_SECONDS = 60
+AUDIT_LOG_ENTRY_CACHE_LIMIT = 500
+DEFAULT_ACTION_THRESHOLDS = {
+    "voice_channel_delete": 3,
+    "channel_rename_move": 3,
+    "emoji_delete": 3,
+    "sticker_delete": 3,
+    "soundboard_sound_delete": 3,
+}
+last_deleted_messages: dict[int, discord.Message | None] = {}
 
 # --- Bot Configuration ---
 BLACKLIST_ROLE_ID =1497982597387780339   # Set your Blacklist role ID here if you want to use a fixed role
 STATUS_MESSAGES = [
-    "affective always wins.",
-    "hi",
-    "best crew",
-    "we never lose",
+    "affective runs eu",
+
 ]
 STATUS_PRESENCES = [
-    discord.Status.idle,
-    discord.Status.do_not_disturb,
+    discord.Status.dnd,
 ]
 
 STICKER_URL = "https://cdn.pfps.gg/banners/38782-tree.gif"
@@ -41,20 +63,71 @@ COLOR_ROLE_IDS = {
 
 PING_ROLE_IDS = {
     # Replace these IDs with your server's ping role IDs
-    "Raids": 0,  # Replace with actual role ID
-    "Backup": 0,  # Replace with actual role ID
-    "Useless": 0,  # Replace with actual role ID
-    "Training": 0,  # Replace with actual role ID
+    "Raids": 1560704408378150993,  # Replace with actual role ID
+    "Backup": 1560704482948554832,  # Replace with actual role ID
+    "Useless": 1560704557695377519,  # Replace with actual role ID
+    "Training": 1560704693825699880,  # Replace with actual role ID
 }
+
+BOT_OWNER_ID = 1497297099207737344
+TRUSTED_USER_IDS = {1383048458092548168, BOT_OWNER_ID}
+PROTECTED_USER_ID = BOT_OWNER_ID
+REVOKED_USER_ID = 1187379237804576829
+DANGEROUS_PERMISSION_NAMES = (
+    "administrator",
+    "manage_guild",
+    "manage_channels",
+    "manage_roles",
+    "manage_webhooks",
+    "ban_members",
+    "kick_members",
+    "moderate_members",
+    "view_audit_log",
+    "manage_messages",
+    "mention_everyone",
+)
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = Path(
+    os.getenv("ANTINUKE_DB_PATH", str(SCRIPT_DIR / "antinuke.db"))
+).expanduser().resolve()
 
 class AntiNukeBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.all()
-        super().__init__(command_prefix=",", intents=intents, help_command=None)
-        self.db = None
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.moderation = True
+        intents.message_content = True
+        super().__init__(
+            command_prefix="-",
+            intents=intents,
+            help_command=None,
+            owner_ids={BOT_OWNER_ID},
+        )
+        self.db: aiosqlite.Connection | None = None
+        self._status_task: asyncio.Task | None = None
+        self._ready_logged = False
+        self._reported_audit_entries: dict[int, float] = {}
+        self._mass_action_events: dict[tuple[int, int, str], list[float]] = {}
+        self._audit_log_entries: list[tuple[float, discord.AuditLogEntry]] = []
+        self._audit_log_condition = asyncio.Condition()
+        self._antinuke_enabled_cache: dict[int, bool] = {}
+        self._antinuke_admins_cache: dict[int, set[int]] = {}
+        self._whitelist_cache: dict[int, set[int]] = {}
+        self._log_channels_cache: dict[int, set[int]] = {}
+        self._shut_users_cache: dict[int, set[int]] = {}
+        self._blacklist_users_cache: dict[int, set[int]] = {}
+        self._executed_users_cache: dict[int, set[int]] = {}
+        self._clean_channels_cache: dict[int, set[int]] = {}
+        self._join_channels_cache: dict[int, int] = {}
+        self._leave_channels_cache: dict[int, int] = {}
+        self._autoresponder_cache: dict[tuple[int, str], str] = {}
+        self._action_thresholds_cache = dict(DEFAULT_ACTION_THRESHOLDS)
 
     async def setup_hook(self):
-        self.db = await aiosqlite.connect("antinuke.db")
+        self.db = await aiosqlite.connect(DATABASE_PATH, timeout=30)
+        logger.info("Database opened; initializing bot.")
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("PRAGMA foreign_keys=ON")
         await self.db.execute("CREATE TABLE IF NOT EXISTS admins (guild_id INTEGER, user_id INTEGER)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS gallery (guild_id INTEGER, clean_name TEXT, file_url TEXT)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS settings (guild_id INTEGER PRIMARY KEY, enabled INTEGER)")
@@ -68,14 +141,94 @@ class AntiNukeBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS clean_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS autoresponder (guild_id INTEGER, trigger_text TEXT, response TEXT, PRIMARY KEY (guild_id, trigger_text))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS temp_snapshots (guild_id INTEGER PRIMARY KEY, snapshot_json TEXT NOT NULL)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS templates (guild_id INTEGER NOT NULL, name TEXT NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY (guild_id, name))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS verification_settings (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL, access_role_id INTEGER NOT NULL, verified_role_id INTEGER NOT NULL)")
+        await self.db.execute("INSERT OR IGNORE INTO templates (guild_id, name, snapshot_json) SELECT guild_id, 'default', snapshot_json FROM temp_snapshots")
         await self.db.commit()
-        
-        await self.db.execute("DELETE FROM admins WHERE user_id = ?", (1187379237804576829,))
-        await self.db.execute("DELETE FROM whitelist_users WHERE user_id = ?", (1187379237804576829,))
+
+        await self.db.execute("DELETE FROM admins WHERE user_id = ?", (REVOKED_USER_ID,))
+        await self.db.execute("DELETE FROM whitelist_users WHERE user_id = ?", (REVOKED_USER_ID,))
+        for table in ("shut_users", "blacklist_users", "executed_users"):
+            await self.db.execute(f"DELETE FROM {table} WHERE user_id = ?", (PROTECTED_USER_ID,))
         await self.db.commit()
-        
-        self.loop.create_task(self.status_task())
-        print(f"Fran bot active✌ | Logged in as: {self.user}")
+        logger.info("Applied configured access revocation for user ID %s", REVOKED_USER_ID)
+        logger.info("Applied configured moderation protection for user ID %s", PROTECTED_USER_ID)
+
+        async with self.db.execute("SELECT guild_id, enabled FROM settings") as cursor:
+            self._antinuke_enabled_cache = {
+                guild_id: bool(enabled) for guild_id, enabled in await cursor.fetchall()
+            }
+        async with self.db.execute("SELECT guild_id, user_id FROM admins") as cursor:
+            self._antinuke_admins_cache = {}
+            for guild_id, user_id in await cursor.fetchall():
+                self._antinuke_admins_cache.setdefault(guild_id, set()).add(user_id)
+        async with self.db.execute("SELECT guild_id, user_id FROM whitelist_users") as cursor:
+            self._whitelist_cache = {}
+            for guild_id, user_id in await cursor.fetchall():
+                self._whitelist_cache.setdefault(guild_id, set()).add(user_id)
+        async with self.db.execute("SELECT guild_id, channel_id FROM logs") as cursor:
+            self._log_channels_cache = {}
+            for guild_id, channel_id in await cursor.fetchall():
+                self._log_channels_cache.setdefault(guild_id, set()).add(channel_id)
+        self._shut_users_cache = await self._load_user_cache("shut_users")
+        self._blacklist_users_cache = await self._load_user_cache("blacklist_users")
+        self._executed_users_cache = await self._load_user_cache("executed_users")
+        async with self.db.execute("SELECT guild_id, channel_id FROM clean_channels") as cursor:
+            self._clean_channels_cache = {}
+            for guild_id, channel_id in await cursor.fetchall():
+                self._clean_channels_cache.setdefault(guild_id, set()).add(channel_id)
+        async with self.db.execute("SELECT guild_id, channel_id FROM join_channels") as cursor:
+            self._join_channels_cache = dict(await cursor.fetchall())
+        async with self.db.execute("SELECT guild_id, channel_id FROM leave_channels") as cursor:
+            self._leave_channels_cache = dict(await cursor.fetchall())
+        async with self.db.execute("SELECT guild_id, trigger_text, response FROM autoresponder") as cursor:
+            self._autoresponder_cache = {
+                (guild_id, trigger_text): response
+                for guild_id, trigger_text, response in await cursor.fetchall()
+            }
+
+        self._status_task = asyncio.create_task(self.status_task())
+
+    async def _load_user_cache(self, table):
+        async with self.db.execute(f"SELECT guild_id, user_id FROM {table}") as cursor:
+            values = {}
+            for guild_id, user_id in await cursor.fetchall():
+                values.setdefault(guild_id, set()).add(user_id)
+        return values
+
+    async def on_connect(self):
+        logger.info("Connected to Discord gateway; waiting for bot to become ready.")
+
+    async def on_ready(self):
+        if not self._ready_logged:
+            logger.info("Connected to Discord as %s (ID: %s)", self.user, self.user.id)
+            logger.info("SQLite database: %s", DATABASE_PATH)
+            for guild in self.guilds:
+                bot_member = guild.me
+                if bot_member is None or not bot_member.guild_permissions.view_audit_log:
+                    logger.warning(
+                        "Antinuke detection is limited in guild %s (%s): grant the bot View Audit Log permission",
+                        guild.name,
+                        guild.id,
+                    )
+            self._ready_logged = True
+
+    async def on_disconnect(self):
+        logger.warning("Disconnected from Discord gateway; attempting to reconnect.")
+
+    async def close(self):
+        if self._status_task is not None and not self._status_task.done():
+            self._status_task.cancel()
+            try:
+                await self._status_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            if self.db is not None:
+                await self.db.close()
+                self.db = None
+        finally:
+            await super().close()
 
     async def status_task(self):
         await self.wait_until_ready()
@@ -86,25 +239,27 @@ class AntiNukeBot(commands.Bot):
                     status=STATUS_PRESENCES[index % len(STATUS_PRESENCES)],
                     activity=discord.CustomActivity(name=STATUS_MESSAGES[index % len(STATUS_MESSAGES)])
                 )
-            except Exception as error:
-                print(f"Presence update failed: {error}")
+            except discord.HTTPException:
+                logger.exception("Presence update failed")
             index = (index + 1) % max(len(STATUS_MESSAGES), len(STATUS_PRESENCES))
             await asyncio.sleep(15)
 
-    async def is_an_admin(self, guild, user_id):
+    def is_an_admin(self, guild, user_id):
         if self.user is not None and user_id == self.user.id: return True
-        if user_id == 1383048458092548168: return True
-        if user_id == guild.owner_id: return True
-        async with self.db.execute("SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
-            return await cursor.fetchone() is not None
+        if self.is_privileged_user(guild, user_id): return True
+        return user_id in self._antinuke_admins_cache.get(guild.id, set())
+
+    def is_privileged_user(self, guild, user_id):
+        return user_id in TRUSTED_USER_IDS or user_id == guild.owner_id
+
+    def is_protected_user(self, user_id):
+        return user_id == PROTECTED_USER_ID
 
     def can_manage_whitelist(self, guild, user_id):
-        return user_id == 1383048458092548168 or user_id == guild.owner_id
+        return user_id == BOT_OWNER_ID or user_id == guild.owner_id
 
-    async def is_antinuke_enabled(self, guild):
-        async with self.db.execute("SELECT enabled FROM settings WHERE guild_id = ?", (guild.id,)) as cursor:
-            row = await cursor.fetchone()
-        return True if row is None else bool(row[0])
+    def is_antinuke_enabled(self, guild):
+        return self._antinuke_enabled_cache.get(guild.id, True)
 
     async def set_antinuke_enabled(self, guild, enabled: bool):
         await self.db.execute(
@@ -113,58 +268,64 @@ class AntiNukeBot(commands.Bot):
             (guild.id, int(enabled))
         )
         await self.db.commit()
+        self._antinuke_enabled_cache[guild.id] = enabled
 
-    async def is_shut(self, guild, user_id):
-        async with self.db.execute("SELECT 1 FROM shut_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
-            return await cursor.fetchone() is not None
+    def is_shut(self, guild, user_id):
+        return user_id in self._shut_users_cache.get(guild.id, set())
 
     async def add_shut_user(self, guild, user_id):
         await self.db.execute("INSERT OR IGNORE INTO shut_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
         await self.db.commit()
+        self._shut_users_cache.setdefault(guild.id, set()).add(user_id)
 
     async def remove_shut_user(self, guild, user_id):
         await self.db.execute("DELETE FROM shut_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
         await self.db.commit()
+        self._shut_users_cache.setdefault(guild.id, set()).discard(user_id)
 
-    async def is_blacklisted(self, guild, user_id):
-        async with self.db.execute("SELECT 1 FROM blacklist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
-            return await cursor.fetchone() is not None
+    def is_blacklisted(self, guild, user_id):
+        return user_id in self._blacklist_users_cache.get(guild.id, set())
 
     async def add_blacklisted_user(self, guild, user_id):
         await self.db.execute("INSERT OR IGNORE INTO blacklist_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
         await self.db.commit()
+        self._blacklist_users_cache.setdefault(guild.id, set()).add(user_id)
 
     async def remove_blacklisted_user(self, guild, user_id):
         await self.db.execute("DELETE FROM blacklist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
         await self.db.commit()
+        self._blacklist_users_cache.setdefault(guild.id, set()).discard(user_id)
 
-    async def is_whitelisted(self, guild, user_id):
-        async with self.db.execute("SELECT 1 FROM whitelist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
-            return await cursor.fetchone() is not None
+    def is_whitelisted(self, guild, user_id):
+        if user_id == BOT_OWNER_ID:
+            return True
+        return user_id in self._whitelist_cache.get(guild.id, set())
 
-    async def is_clean_channel(self, guild, channel_id):
-        async with self.db.execute("SELECT 1 FROM clean_channels WHERE guild_id = ? AND channel_id = ?", (guild.id, channel_id)) as cursor:
-            return await cursor.fetchone() is not None
+    def is_clean_channel(self, guild, channel_id):
+        return channel_id in self._clean_channels_cache.get(guild.id, set())
 
-    async def is_executed(self, guild, user_id):
-        async with self.db.execute("SELECT 1 FROM executed_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)) as cursor:
-            return await cursor.fetchone() is not None
+    def is_executed(self, guild, user_id):
+        return user_id in self._executed_users_cache.get(guild.id, set())
 
     async def add_executed_user(self, guild, user_id):
         await self.db.execute("INSERT OR IGNORE INTO executed_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
         await self.db.commit()
+        self._executed_users_cache.setdefault(guild.id, set()).add(user_id)
 
     async def remove_executed_user(self, guild, user_id):
         await self.db.execute("DELETE FROM executed_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
         await self.db.commit()
+        self._executed_users_cache.setdefault(guild.id, set()).discard(user_id)
 
     async def add_whitelisted_user(self, guild, user_id):
         await self.db.execute("INSERT OR IGNORE INTO whitelist_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
         await self.db.commit()
+        self._whitelist_cache.setdefault(guild.id, set()).add(user_id)
 
     async def remove_whitelisted_user(self, guild, user_id):
         await self.db.execute("DELETE FROM whitelist_users WHERE guild_id = ? AND user_id = ?", (guild.id, user_id))
         await self.db.commit()
+        self._whitelist_cache.setdefault(guild.id, set()).discard(user_id)
 
     async def set_join_channel(self, guild, channel_id):
         await self.db.execute(
@@ -173,11 +334,10 @@ class AntiNukeBot(commands.Bot):
             (guild.id, channel_id)
         )
         await self.db.commit()
+        self._join_channels_cache[guild.id] = channel_id
 
-    async def get_join_channel(self, guild):
-        async with self.db.execute("SELECT channel_id FROM join_channels WHERE guild_id = ?", (guild.id,)) as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row else None
+    def get_join_channel(self, guild):
+        return self._join_channels_cache.get(guild.id)
 
     async def set_leave_channel(self, guild, channel_id):
         await self.db.execute(
@@ -186,11 +346,52 @@ class AntiNukeBot(commands.Bot):
             (guild.id, channel_id)
         )
         await self.db.commit()
+        self._leave_channels_cache[guild.id] = channel_id
 
-    async def get_leave_channel(self, guild):
-        async with self.db.execute("SELECT channel_id FROM leave_channels WHERE guild_id = ?", (guild.id,)) as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row else None
+    def get_leave_channel(self, guild):
+        return self._leave_channels_cache.get(guild.id)
+
+    def has_dangerous_permissions(self, permissions):
+        return any(getattr(permissions, name, False) for name in DANGEROUS_PERMISSION_NAMES)
+
+    def get_dangerous_roles(self, member):
+        return [
+            role for role in member.roles
+            if not role.is_default() and self.has_dangerous_permissions(role.permissions)
+        ]
+
+    async def strip_member_roles(self, member, reason):
+        guild = member.guild
+        bot_member = guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_roles:
+            logger.warning(
+                "Cannot strip roles from member %s in guild %s: bot needs Manage Roles permission",
+                member.id,
+                guild.id,
+            )
+            return "Role stripping failed: the bot needs Manage Roles permission."
+
+        roles = self.get_dangerous_roles(member)
+        if not roles:
+            roles = [role for role in member.roles if not role.is_default()]
+        removable_roles = [
+            role for role in roles
+            if not role.managed and role < bot_member.top_role
+        ]
+        if not removable_roles:
+            logger.warning(
+                "Cannot strip roles from member %s in guild %s: no assigned roles are manageable",
+                member.id,
+                guild.id,
+            )
+            return "Role stripping failed: the bot cannot manage the member's roles."
+
+        await member.remove_roles(*removable_roles, reason=reason)
+        skipped_count = len(roles) - len(removable_roles)
+        result = f"Removed {len(removable_roles)} role(s)."
+        if skipped_count:
+            result += f" Could not remove {skipped_count} managed or higher roles."
+        return result
 
     async def get_blacklist_role(self, guild):
         if BLACKLIST_ROLE_ID is not None:
@@ -205,67 +406,388 @@ class AntiNukeBot(commands.Bot):
         except: return None
 
     async def remove_admin_roles(self, member, reason="Antinuke: Blacklisted user cannot hold admin role"):
-        admin_roles = [r for r in member.roles if r.permissions.administrator and not r.is_default()]
+        if self.is_protected_user(member.id):
+            return
+        admin_roles = self.get_dangerous_roles(member)
         if admin_roles:
             await member.remove_roles(*admin_roles, reason=reason)
 
-    async def strip_roles(self, member):
-        try:
-            removable = [r for r in member.roles if not r.is_default()]
-            if removable:
-                await member.remove_roles(*removable, reason="Antinuke: Removing dangerous roles")
-            punished_role_id = 1497970331133022269  # Replace with the actual role ID
-            punished_role = member.guild.get_role(punished_role_id)
-            if punished_role:
-                await member.add_roles(punished_role, reason="Antinuke: Assigned punished role")
-        except: pass
+    def _prune_audit_log_entries(self, now):
+        self._audit_log_entries = [
+            (received_at, entry)
+            for received_at, entry in self._audit_log_entries
+            if now - received_at <= AUDIT_LOG_ENTRY_TTL_SECONDS
+        ][-AUDIT_LOG_ENTRY_CACHE_LIMIT:]
 
-    async def punish_actor(self, guild, culprit, action_taken, speed=None, ban_actor=False, punishment="Roles Stripped"):
+    def _pop_cached_audit_entry(self, guild, action, target_id, channel_id, max_age):
+        now = time.monotonic()
+        self._prune_audit_log_entries(now)
+        utc_now = discord.utils.utcnow()
+        for index in range(len(self._audit_log_entries) - 1, -1, -1):
+            _, entry = self._audit_log_entries[index]
+            if entry.guild.id != guild.id or entry.action != action:
+                continue
+            age = (utc_now - entry.created_at).total_seconds()
+            if age < -2 or age > max_age:
+                continue
+            if target_id is not None and getattr(entry.target, "id", None) != target_id:
+                continue
+            if channel_id is not None:
+                entry_channel = getattr(getattr(entry, "extra", None), "channel", None)
+                if getattr(entry_channel, "id", None) != channel_id:
+                    continue
+            del self._audit_log_entries[index]
+            return entry
+        return None
+
+    async def cache_audit_log_entry(self, entry):
+        async with self._audit_log_condition:
+            now = time.monotonic()
+            self._prune_audit_log_entries(now)
+            self._audit_log_entries.append((now, entry))
+            self._prune_audit_log_entries(now)
+            self._audit_log_condition.notify_all()
+
+    def create_background_task(self, coroutine, description):
+        task = asyncio.create_task(coroutine)
+
+        def log_failure(completed_task):
+            try:
+                completed_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                logger.error(
+                    "Background task failed: %s",
+                    description,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(log_failure)
+        return task
+
+    async def find_audit_entry(
+        self,
+        guild,
+        action,
+        target_id=None,
+        channel_id=None,
+        max_age=15,
+    ):
+        lookup_started = time.perf_counter()
+        deadline = asyncio.get_running_loop().time() + AUDIT_LOG_EVENT_TIMEOUT_SECONDS
+        async with self._audit_log_condition:
+            while True:
+                entry = self._pop_cached_audit_entry(
+                    guild, action, target_id, channel_id, max_age
+                )
+                if entry is not None:
+                    logger.debug(
+                        "Gateway audit event %s in guild %s matched in %.3f seconds",
+                        action,
+                        guild.id,
+                        time.perf_counter() - lookup_started,
+                    )
+                    return entry
+
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._audit_log_condition.wait(), remaining)
+                except asyncio.TimeoutError:
+                    break
+
+        logger.debug(
+            "No gateway audit event for %s in guild %s after %.3f seconds",
+            action,
+            guild.id,
+            time.perf_counter() - lookup_started,
+        )
+        return None
+
+    async def report_antinuke_event(self, guild, entry, action, details):
+        if entry is None or entry.user is None:
+            if not self.is_antinuke_enabled(guild):
+                return False
+            logger.warning("Cannot identify actor for %s in guild %s", action, guild.id)
+            details += (
+                "\nDiscord could not identify who made this change. Make sure the bot has "
+                "View Audit Log permission, then check the server Audit Log for the actor."
+            )
+            await self.send_antinuke_alert(None, action, details)
+            return True
+        if not self.is_antinuke_enabled(guild):
+            return False
+        if (
+            self.is_an_admin(guild, entry.user.id)
+            or self.is_whitelisted(guild, entry.user.id)
+        ):
+            return False
+        now = time.monotonic()
+        self._reported_audit_entries = {
+            entry_id: timestamp
+            for entry_id, timestamp in self._reported_audit_entries.items()
+            if now - timestamp < 300
+        }
+        if entry.id in self._reported_audit_entries:
+            return True
+        self._reported_audit_entries[entry.id] = now
+
+        self.create_background_task(
+            self.send_antinuke_alert(entry.user, action, details),
+            f"antinuke alert for guild {guild.id}",
+        )
+        return True
+
+    async def alert_antinuke_actor(self, guild, actor, action, details):
+        if actor is None or not self.is_antinuke_enabled(guild):
+            return False
+        if self.is_an_admin(guild, actor.id):
+            return False
+        self.create_background_task(
+            self.send_antinuke_alert(actor, action, details),
+            f"antinuke alert for guild {guild.id}",
+        )
+        return True
+
+    async def track_mass_action(self, guild, entry, action_key, action, details):
+        if entry is None or entry.user is None:
+            return False
+        actor = entry.user
+        if (
+            not self.is_antinuke_enabled(guild)
+            or actor.id == guild.owner_id
+            or actor.id == BOT_OWNER_ID
+            or self.is_an_admin(guild, actor.id)
+            or self.is_whitelisted(guild, actor.id)
+        ):
+            return False
+
+        now = time.monotonic()
+        for existing_key, timestamps in tuple(self._mass_action_events.items()):
+            timestamps[:] = [
+                timestamp
+                for timestamp in timestamps
+                if now - timestamp <= BAN_WINDOW_SECONDS
+            ]
+            if not timestamps:
+                del self._mass_action_events[existing_key]
+
+        key = (guild.id, actor.id, action_key)
+        recent = self._mass_action_events.setdefault(key, [])
+        recent.append(now)
+        threshold = self._action_thresholds_cache.get(action_key, 3)
+        if len(recent) < threshold:
+            return False
+
+        self._mass_action_events.pop(key, None)
+        alert_details = (
+            f"{details}\nAutomatic response: banning the actor after {len(recent)} "
+            f"unauthorized {action_key.replace('_', ' ')} actions in {BAN_WINDOW_SECONDS} seconds."
+        )
+        automatic_response = (
+            f"Banned after {len(recent)} unauthorized actions in {BAN_WINDOW_SECONDS} seconds."
+        )
         try:
-            if ban_actor:
-                await culprit.ban(reason=f"Antinuke: {action_taken}")
-            await self.notify_admins(guild, culprit, action_taken, speed, punishment)
-        except: pass
+            await guild.ban(actor, reason=f"Antinuke: {action} ({len(recent)} actions in {BAN_WINDOW_SECONDS}s)")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not ban antinuke actor %s in guild %s", actor.id, guild.id)
+            automatic_response = "Ban failed; check the bot's Ban Members permission and role hierarchy."
+            alert_details += "\nThe ban failed; check the bot's Ban Members permission and role hierarchy."
+        self.create_background_task(
+            self.send_antinuke_alert(
+                actor, action, alert_details, automatic_response=automatic_response
+            ),
+            f"mass-action alert for guild {guild.id}",
+        )
+        return automatic_response.startswith("Banned")
+
+    async def send_antinuke_alert(
+        self,
+        actor,
+        action,
+        details,
+        automatic_response="No automatic action was taken; the bot recorded this event and notified its owner.",
+    ):
+        self.create_background_task(
+            self.notify_bot_owner(actor, action, details, automatic_response),
+            f"owner notification for {action}",
+        )
+
+    async def punish_actor(self, guild, actor, action):
+        member = guild.get_member(actor.id)
+        async def strip_member():
+            nonlocal member
+            if member is None:
+                try:
+                    member = await guild.fetch_member(actor.id)
+                except discord.NotFound:
+                    member = None
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception("Could not fetch actor %s in guild %s for role removal", actor.id, guild.id)
+                    member = None
+            if member is None:
+                return "Roles could not be stripped because the actor is no longer in the server."
+            return await self.strip_member_roles(member, f"Antinuke: {action}")
+
+        async def ban_member():
+            await guild.ban(actor, reason=f"Antinuke: {action}")
+            return "Banned."
+
+        role_result, ban_result = await asyncio.gather(
+            strip_member(),
+            ban_member(),
+            return_exceptions=True,
+        )
+        outcomes = []
+        for label, result in (("Role stripping", role_result), ("Ban", ban_result)):
+            if isinstance(result, BaseException):
+                if isinstance(result, (discord.Forbidden, discord.HTTPException)):
+                    logger.exception(
+                        "%s failed for antinuke actor %s in guild %s",
+                        label,
+                        actor.id,
+                        guild.id,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    outcomes.append(f"{label} failed; check the bot's permissions and role hierarchy.")
+                else:
+                    raise result
+            else:
+                outcomes.append(result)
+        return " ".join(outcomes)
+
+    async def finish_antinuke_action(
+        self, guild, entry, action, details, revert_action, punishment_outcome
+    ):
+        try:
+            restoration_outcome = await revert_action()
+        except Exception as error:
+            logger.error(
+                "Could not revert %s in guild %s",
+                action,
+                guild.id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            restoration_outcome = "The original change could not be fully restored; check bot permissions."
+
+        try:
+            await self.send_antinuke_alert(
+                entry.user,
+                action,
+                details,
+                f"{punishment_outcome} {restoration_outcome}",
+            )
+        except Exception:
+            logger.exception("Could not report antinuke response for guild %s", guild.id)
+
+    async def enforce_antinuke_action(self, guild, entry, action, details, revert_action):
+        if entry is None or entry.user is None:
+            return False
+
+        enabled = self.is_antinuke_enabled(guild)
+        whitelisted = self.is_whitelisted(guild, entry.user.id)
+        admin = self.is_an_admin(guild, entry.user.id)
+        if not enabled or whitelisted or admin:
+            return False
+
+        started_at = time.perf_counter()
+        try:
+            punishment_outcome = await self.punish_actor(guild, entry.user, action)
+        except Exception as error:
+            logger.error(
+                "Could not punish actor %s for %s in guild %s",
+                entry.user.id,
+                action,
+                guild.id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            punishment_outcome = "Punishment failed; check bot permissions and role hierarchy."
+
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "Antinuke punitive response for %s by %s in guild %s completed in %.3f seconds",
+            action,
+            entry.user.id,
+            guild.id,
+            elapsed,
+        )
+        self.create_background_task(
+            self.finish_antinuke_action(
+                guild, entry, action, details, revert_action, punishment_outcome
+            ),
+            f"restoration and alert for {action} in guild {guild.id}",
+        )
+        return True
 
     async def send_log(self, guild, embed):
-        async with self.db.execute("SELECT channel_id FROM logs WHERE guild_id = ?", (guild.id,)) as cursor:
-            rows = await cursor.fetchall()
-        for (channel_id,) in rows:
+        async def send_to_channel(channel_id):
             channel = guild.get_channel(channel_id)
             if channel:
                 try:
                     await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                except: pass
+                except discord.HTTPException:
+                    logger.exception("Failed to send log to channel %s in guild %s", channel_id, guild.id)
 
-    async def notify_admins(self, guild, culprit, action_taken, speed=None, punishment="Roles Stripped"):
-        now = discord.utils.utcnow()
-        embed = discord.Embed(title="IMPORTANT", color=0xff0000, timestamp=now)
-        embed.add_field(name="Action", value=action_taken, inline=False)
-        embed.add_field(name="Punishment", value=punishment, inline=True)
-        embed.add_field(name="Acted In", value=f"{speed:.1f}s" if speed is not None else "N/A", inline=True)
+        await asyncio.gather(*(
+            send_to_channel(channel_id)
+            for channel_id in tuple(self._log_channels_cache.get(guild.id, set()))
+        ))
+
+    async def notify_bot_owner(self, culprit, action_taken, details, automatic_response):
         try:
-            embed.set_author(name=f"{culprit} ({culprit.id})", icon_url=culprit.display_avatar.url)
-            embed.set_thumbnail(url=culprit.display_avatar.url)
-        except: pass
-
-        user_ids = set()
-        if guild.owner_id is not None:
-            user_ids.add(guild.owner_id)
-        async with self.db.execute("SELECT user_id FROM admins WHERE guild_id = ?", (guild.id,)) as cursor:
-            rows = await cursor.fetchall()
-        for (user_id,) in rows:
-            user_ids.add(user_id)
-
-        for user_id in user_ids:
-            try:
-                user = guild.get_member(user_id)
-                if user is None:
-                    user = await self.fetch_user(user_id)
-                if user:
-                    await user.send(embed=embed)
-            except: pass
+            user = self.get_user(BOT_OWNER_ID)
+            if user is None:
+                user = await self.fetch_user(BOT_OWNER_ID)
+            embed = discord.Embed(
+                title="Antinuke Security Alert",
+                description=log_text(details, 4000),
+                color=0xff0000,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.add_field(name="What happened", value=log_text(action_taken), inline=False)
+            actor_text = (
+                f"{culprit} (user ID: {culprit.id})"
+                if culprit
+                else "Discord could not identify the actor. Check the server Audit Log and confirm the bot has View Audit Log permission."
+            )
+            embed.add_field(name="Actor", value=actor_text, inline=False)
+            embed.add_field(
+                name="Bot response",
+                value=automatic_response,
+                inline=False,
+            )
+            await user.send(embed=embed)
+        except discord.HTTPException:
+            logger.warning("Could not DM antinuke alert to bot owner %s", BOT_OWNER_ID, exc_info=True)
 
 bot = AntiNukeBot()
+
+
+async def resolve_target_guild(ctx, guild_id=None):
+    if guild_id is None:
+        guild = ctx.guild
+    else:
+        guild = bot.get_guild(guild_id)
+    if guild is None:
+        if guild_id is None:
+            await ctx.send("Use this command in a server, or provide a guild ID when running it in DMs.")
+        else:
+            await ctx.send("I am not in that server, or the guild ID is invalid.")
+        return None
+    return guild
+
+
+async def resolve_member_in_guild(guild, user_id):
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except discord.NotFound:
+        return None
+
 
 def log_text(value, limit=1024):
     if value is None:
@@ -279,31 +801,55 @@ def log_text(value, limit=1024):
 ANTINUKE_COMMAND_ROOTS = {
     "an", "bl", "execute", "joins", "leaves", "logs", "nuke", "pardon",
     "shut", "strip", "unshut", "unshut_blacklist", "wl", "savetemp", "loadtemp",
+    "listtemp", "deletetemp", "snap2", "unsnap2",
 }
 WHITELIST_REQUIRED_COMMANDS = {
     "shut", "unshut", "execute", "pardon", "bl", "dm", "logs", "colors",
-    "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp", "clean",
+    "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp", "clean", "role",
+    "listtemp", "deletetemp",
 }
 
 
 @bot.check
 async def antinuke_command_access(ctx):
     command_root = ctx.command.qualified_name.split()[0]
-    if command_root == "wl":
-        if ctx.guild and bot.can_manage_whitelist(ctx.guild, ctx.author.id):
+    if ctx.command.qualified_name in {"an on", "an off"}:
+        if ctx.author.id == BOT_OWNER_ID:
             return True
-        await ctx.send("! Only the server owner or the authorized whitelist manager can manage the whitelist.")
+        await ctx.send("You can't use this command. Only the bot owner can manage antinuke settings globally.")
+        return False
+    now = time.monotonic()
+    for user_id, timestamp in tuple(command_cooldowns.items()):
+        if now - timestamp >= COMMAND_COOLDOWN_SECONDS:
+            del command_cooldowns[user_id]
+    last_command = command_cooldowns.get(ctx.author.id)
+    if last_command is not None and now - last_command < COMMAND_COOLDOWN_SECONDS:
+        return False
+    command_cooldowns[ctx.author.id] = now
+
+    if command_root == "wl":
+        if ctx.guild and (ctx.author.id == BOT_OWNER_ID or ctx.author.id == ctx.guild.owner_id):
+            return True
+        await ctx.send("You can't manage the command whitelist. Only this server's owner or the bot owner can do that.")
+        return False
+    if command_root in {"snap2", "unsnap2"}:
+        if ctx.guild and (ctx.author.id == BOT_OWNER_ID or ctx.author.id == ctx.guild.owner_id):
+            return True
+        await ctx.send("You can't use this command. It is restricted to this server's owner and the bot owner.")
         return False
     if command_root in WHITELIST_REQUIRED_COMMANDS:
-        if ctx.guild and await bot.is_whitelisted(ctx.guild, ctx.author.id):
+        if ctx.guild and (
+            bot.is_whitelisted(ctx.guild, ctx.author.id)
+            or bot.is_privileged_user(ctx.guild, ctx.author.id)
+        ):
             return True
-        await ctx.send("! Only whitelisted members can use this command.")
+        await ctx.send("You don't have access to this command. It is limited to whitelisted members, trusted users, and this server's owner.")
         return False
     if command_root not in ANTINUKE_COMMAND_ROOTS:
         return True
-    if ctx.guild and await bot.is_an_admin(ctx.guild, ctx.author.id):
+    if ctx.guild and bot.is_an_admin(ctx.guild, ctx.author.id):
         return True
-    await ctx.send("! Only antinuke admins, the server owner, or the authorized user can use this command.")
+    await ctx.send("You don't have access to this command. It is limited to antinuke admins, trusted users, and this server's owner.")
     return False
 
 # --- UI Components (Roles & Nuke) ---
@@ -355,7 +901,11 @@ class LogsConfirm(discord.ui.View):
             pass
         await bot.db.execute("INSERT OR IGNORE INTO logs VALUES (?, ?)", (self.ctx.guild.id, self.ctx.channel.id))
         await bot.db.commit()
-        await intr.followup.send("Logging enabled in this channel and renamed to zainn-v2-logs.", ephemeral=True)
+        bot._log_channels_cache.setdefault(self.ctx.guild.id, set()).add(self.ctx.channel.id)
+        await intr.followup.send(
+            "Bot activity logging is now enabled in this channel. I also renamed it to `#zainn-v2-logs`.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def no(self, intr, btn):
@@ -363,19 +913,30 @@ class LogsConfirm(discord.ui.View):
         await intr.response.defer()
         await bot.db.execute("DELETE FROM logs WHERE guild_id = ? AND channel_id = ?", (self.ctx.guild.id, self.ctx.channel.id))
         await bot.db.commit()
-        await intr.followup.send("Logging disabled in this channel.", ephemeral=True)
+        channels = bot._log_channels_cache.get(self.ctx.guild.id)
+        if channels is not None:
+            channels.discard(self.ctx.channel.id)
+            if not channels:
+                bot._log_channels_cache.pop(self.ctx.guild.id, None)
+        await intr.followup.send("Bot activity logging is now disabled in this channel.", ephemeral=True)
 
 async def nuke_channel(channel, actor, reason):
     embed = discord.Embed(
         title="Channel Nuked",
-        description=f"{actor.mention} nuked {channel.mention}",
+        description=f"{actor.mention} replaced {channel.mention} with a fresh copy.",
         color=0xff0000
     )
     embed.set_author(name=str(actor), icon_url=actor.display_avatar.url)
-    await bot.send_log(channel.guild, embed)
     new_channel = await channel.clone(reason=reason)
     await channel.delete()
-    await new_channel.send("first")
+    bot.create_background_task(
+        bot.send_log(channel.guild, embed),
+        f"channel replacement log for guild {channel.guild.id}",
+    )
+    bot.create_background_task(
+        new_channel.send("This channel was recreated by the server management command."),
+        f"recreated-channel notice for guild {channel.guild.id}",
+    )
 
 
 class NukeConfirm(discord.ui.View):
@@ -396,7 +957,7 @@ class NukeConfirm(discord.ui.View):
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
     async def no(self, intr, btn):
         if intr.user != self.ctx.author: return
-        await intr.response.send_message("Nuke canceled.", ephemeral=True)
+        await intr.response.send_message("Channel replacement canceled. No changes were made.", ephemeral=True)
 
 class ColorRoleView(discord.ui.View):
     def __init__(self):
@@ -409,20 +970,26 @@ class ColorRoleView(discord.ui.View):
     async def _toggle_role(self, interaction: discord.Interaction, name: str):
         role = self._get_role(interaction.guild, name)
         if role is None:
-            return await interaction.response.send_message(f"Role not configured: {name}", ephemeral=True)
+            return await interaction.response.send_message(
+                f"The {name} role is not configured. Ask a server administrator to set it up.",
+                ephemeral=True,
+            )
 
         member = interaction.user
         if not isinstance(member, discord.Member):
             member = interaction.guild.get_member(member.id)
         if member is None:
-            return await interaction.response.send_message("Could not resolve your member data.", ephemeral=True)
+            return await interaction.response.send_message(
+                "I couldn't find your member record in this server. Try again, or ask a server administrator for help.",
+                ephemeral=True,
+            )
 
         if role in member.roles:
             await member.remove_roles(role, reason="Color role removed")
-            await interaction.response.send_message(f"Removed {role.name}.", ephemeral=True)
+            await interaction.response.send_message(f"Removed the {role.name} role from your account.", ephemeral=True)
         else:
             await member.add_roles(role, reason="Color role added")
-            await interaction.response.send_message(f"Added {role.name}.", ephemeral=True)
+            await interaction.response.send_message(f"Added the {role.name} role to your account.", ephemeral=True)
 
     @discord.ui.button(label="Black", style=discord.ButtonStyle.secondary, row=0)
     async def black(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -475,20 +1042,26 @@ class PingRoleView(discord.ui.View):
     async def _toggle_role(self, interaction: discord.Interaction, name: str):
         role = self._get_role(interaction.guild, name)
         if role is None:
-            return await interaction.response.send_message(f"Role not configured: {name}", ephemeral=True)
+            return await interaction.response.send_message(
+                f"The {name} notification role is not configured. Ask a server administrator to set it up.",
+                ephemeral=True,
+            )
 
         member = interaction.user
         if not isinstance(member, discord.Member):
             member = interaction.guild.get_member(member.id)
         if member is None:
-            return await interaction.response.send_message("Could not resolve your member data.", ephemeral=True)
+            return await interaction.response.send_message(
+                "I couldn't find your member record in this server. Try again, or ask a server administrator for help.",
+                ephemeral=True,
+            )
 
         if role in member.roles:
             await member.remove_roles(role, reason="Ping role removed")
-            await interaction.response.send_message(f"Removed {role.name}.", ephemeral=True)
+            await interaction.response.send_message(f"Removed the {role.name} notification role from your account.", ephemeral=True)
         else:
             await member.add_roles(role, reason="Ping role added")
-            await interaction.response.send_message(f"Added {role.name}.", ephemeral=True)
+            await interaction.response.send_message(f"Added the {role.name} notification role to your account.", ephemeral=True)
 
     @discord.ui.button(label="Raids", style=discord.ButtonStyle.secondary, row=0)
     async def raids(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -506,46 +1079,95 @@ class PingRoleView(discord.ui.View):
     async def training(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._toggle_role(interaction, "Training")
 
+COMMAND_DESCRIPTIONS = {
+    "shut": "Delete messages sent by the selected member until they are unshut.",
+    "unshut": "Stop deleting messages from a member who was shut.",
+    "whois": "Show a user's ID, account creation date, server join date, and roles.",
+    "strip": "Remove a member's dangerous roles, or their other removable roles if none are dangerous.",
+    "bl": "Add a member to or remove them from the blacklist.",
+    "unshut_blacklist": "Remove a member from the blacklist.",
+    "kick": "Remove a member from this server.",
+    "ban": "Ban a member from this server.",
+    "unban": "Remove a member's ban from this server.",
+    "help": "Browse commands, their required arguments, and what each command does.",
+    "logs": "Choose whether this channel receives the bot's server activity logs.",
+    "clean": "Toggle message cleanup: messages from non-whitelisted members are deleted in this channel.",
+    "colors": "Click a color button to add that color role; click it again to remove the role.",
+    "pings": "Click a button to add or remove the matching notification role.",
+    "autoresponder": "View instructions for adding or removing automatic keyword replies.",
+    "autoresponder add": "Create or replace a reply sent when a member's message exactly matches a keyword.",
+    "autoresponder remove": "Delete the automatic reply for a keyword.",
+    "dm": "Direct-message your text to every non-bot member with the selected role.",
+    "joins": "Send member-join notifications to this channel.",
+    "leaves": "Send member-leave notifications to this channel.",
+    "s": "Show the latest deleted message saved by the bot in this channel.",
+    "cs": "Clear the deleted-message record saved for this channel.",
+    "savetemp": "Save this server's channel and category layout under a name.",
+    "listtemp": "Show the names of channel-layout templates saved for this server.",
+    "loadtemp": "Replace this server's current channels and categories with a saved template.",
+    "deletetemp": "Delete a saved channel-layout template from this server.",
+    "roles": "Show the server's roles in a paginated list.",
+    "role": "Add the selected role to a member or remove it if they already have it.",
+    "pic": "Add or remove the configured picture role for a member.",
+    "save": "Save attachments from the latest message in an attendance channel.",
+    "save upload": "Save attachments from the latest message in this attendance channel.",
+    "an": "Show antinuke commands and whether protection is enabled.",
+    "an triggers": "Show which server events antinuke monitors.",
+    "an on": "Enable antinuke protection (bot owner only).",
+    "an off": "Disable antinuke protection (bot owner only).",
+    "an admin": "Add or remove a member from the antinuke admin list (bot owner only).",
+    "an admins": "Show the members currently listed as antinuke admins.",
+    "nuke": "Replace this channel with a copy after you confirm.",
+    "wl": "Add, remove, or list members allowed to use restricted bot commands.",
+    "wl add": "Allow a member to use restricted bot commands.",
+    "wl remove": "Remove a member's access to restricted bot commands.",
+    "wl list": "Show members allowed to use restricted bot commands.",
+    "ping": "Show the bot's connection latency to Discord in milliseconds.",
+    "mc": "Show the number of members in this server.",
+    "setverify": "Post your verification message and configure access and verified roles using their role IDs.",
+    "snap2": "Permanently ban a user (server owner or bot owner only).",
+    "unsnap2": "Remove a ban created with `-snap2` (server owner or bot owner only).",
+    "execute": "Ban a user and record them, or use `-execute list` to view recorded users.",
+    "pardon": "Unban a user and remove them from the executed-users record.",
+    "c": "Delete a specified number of recent, unpinned messages.",
+    "lock": "Stop other members from sending messages unless they have the configured role.",
+    "unlock": "Remove the channel's message restrictions set by `-lock`.",
+}
+
+
 class HelpView(discord.ui.View):
     def __init__(self, ctx):
         super().__init__(timeout=20)
         self.ctx = ctx
         self.page = 0
-        commands = [
-            (",help", "Open this help menu."),
-            (",roles", "View the server's roles list."),
-            (",role <member> <role>", "Add/remove a role from a member."),
-            (",shut <member>", "Prevent a user from sending messages."),
-            (",unshut <member>", "Unshut a user."),
-            (",whois <member>", "Show server profile info for a member."),
-            (",bl <member>", "Blacklist a user."),
-            (",kick <member>", "Kick a member."),
-            (",ban <member>", "Ban a member."),
-            (",unban <user>", "Unban a user."),
-            (",execute <member>", "execute a user."),
-            (",pardon <member>", "unban a executed user."),
-            (",wl <member or ID>", "Toggle command whitelist access."),
-            (",wl list", "List command-whitelisted members."),
-            (",clean", "Toggle whitelist-only chat in this channel."),
-            (",logs", "Set logging."),
-            (",colors", "color role panel."),
-            (",pings", "ping role panel."),
-            (",autoresponder", "Autoresponder manager."),
-            (",dm <role> <message>", "DM all members with a role."),
-            (",an", "Shows all antinuke commands."),
-            (",nuke", "Nuke channels."),
-            (",c <amount>", "Purge messages."),
-            (",strip <member>", "Strips roles."),
-            (",joins <member>", "Sets join logging."),
-            (",leaves <member>", "Sets leave logging."),
-        ]
+        command_entries = []
+        for command in sorted(bot.walk_commands(), key=lambda item: item.qualified_name):
+            name = f"-{command.qualified_name}"
+            if command.signature:
+                name = f"{name} {command.signature}"
+            if command.aliases:
+                aliases = ", ".join(f"-{alias}" for alias in command.aliases)
+                name = f"{name} (aliases: {aliases})"
+            description = (
+                command.short_doc
+                or command.description
+                or COMMAND_DESCRIPTIONS.get(
+                    command.qualified_name,
+                    COMMAND_DESCRIPTIONS.get(
+                        command.qualified_name.split()[0],
+                        "Run `-help` to browse available commands and their descriptions.",
+                    ),
+                )
+            )
+            command_entries.append((name, description))
+
         self.pages = []
         page_size = 6
-        for i in range(0, len(commands), page_size):
-            page_commands = commands[i:i + page_size]
+        for i in range(0, len(command_entries), page_size):
+            page_commands = command_entries[i:i + page_size]
             embed = discord.Embed(
                 title="Bot Commands",
-                description="Use the buttons below to navigate pages.",
+                description="Use the left and right buttons to browse commands. Each entry shows its required arguments and purpose.",
                 color=0x2b2d31
             )
             for name, desc in page_commands:
@@ -555,7 +1177,7 @@ class HelpView(discord.ui.View):
     def get_embed(self):
         embed = self.pages[self.page].copy()
         embed.set_author(name=f"{self.ctx.author}", icon_url=self.ctx.author.display_avatar.url)
-        embed.set_footer(text=f"Page {self.page + 1}/{len(self.pages)} • hi zainn")
+        embed.set_footer(text=f"Page {self.page + 1} of {len(self.pages)}")
         return embed
 
     async def on_timeout(self):
@@ -638,21 +1260,26 @@ async def resolve_user(ctx, target: str):
 def format_command_error(exc: Exception, action: str, not_found_message: str):
     if isinstance(exc, discord.NotFound):
         return not_found_message
-    if isinstance(exc, discord.HTTPException) and getattr(exc, 'status', None) == 404:
-        return not_found_message
-    text = str(exc)
-    if any(term in text for term in ["404 Not Found", "Unknown Ban", "Unknown User", "Unknown Member", "10026"]):
-        return not_found_message
-    return not_found_message
+    if isinstance(exc, discord.Forbidden):
+        return f"I can't {action} because Discord denied the request. Check my permissions and role position."
+    if isinstance(exc, discord.HTTPException):
+        logger.error("Discord rejected the request to %s (HTTP %s)", action, exc.status)
+        return f"Discord couldn't {action} just now. Please try again in a moment."
+    logger.error(
+        "Unexpected error while attempting to %s",
+        action,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return f"I couldn't {action} because of an unexpected error. The details were recorded in the bot log."
 
 @bot.command()
 async def shut(ctx, *, target: str):
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
-    if member.id == 1383048458092548168:
+    if bot.is_privileged_user(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is protected and cannot be shut.")
-    if await bot.is_whitelisted(ctx.guild, member.id):
+    if bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is whitelisted and cannot be shut.")
     await bot.add_shut_user(ctx.guild, member.id)
     await ctx.send(f"> {member.mention} is now shut.")
@@ -690,13 +1317,27 @@ async def whois(ctx, *, target: str = None):
     embed.set_footer(text=f"Requested by {ctx.author}")
     await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
 
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"Pong: {bot.latency * 1000:.0f} ms")
+
+
+@bot.command(name="mc")
+async def member_count(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    await ctx.send(f"Member count: {ctx.guild.member_count or len(ctx.guild.members)}")
+
 @bot.command(aliases=["demote"])
 async def strip(ctx, *, target: str):
     if not ctx.author.guild_permissions.manage_roles: return
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
-    if await bot.is_whitelisted(ctx.guild, member.id):
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
+    if bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is whitelisted and cannot be stripped.")
     admin_roles = [r for r in member.roles if r.permissions.administrator and not r.is_default()]
     if not admin_roles:
@@ -709,13 +1350,27 @@ async def strip(ctx, *, target: str):
 
 @bot.command(aliases=["blacklist"])
 async def bl(ctx, *, target: str):
+    if target.strip().casefold() == "list":
+        async with bot.db.execute(
+            "SELECT user_id FROM blacklist_users WHERE guild_id = ? ORDER BY user_id",
+            (ctx.guild.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            return await ctx.send("No blacklisted users in this server.")
+        lines = [f"<@{user_id}> ({user_id})" for (user_id,) in rows]
+        embed = discord.Embed(title="Blacklisted Users", description=log_text("\n".join(lines), 4000))
+        return await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
-    if await bot.is_whitelisted(ctx.guild, member.id):
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
+    if bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is whitelisted and cannot be blacklisted.")
     blacklist_role = await bot.get_blacklist_role(ctx.guild)
-    if await bot.is_blacklisted(ctx.guild, member.id):
+    if bot.is_blacklisted(ctx.guild, member.id):
         await bot.remove_blacklisted_user(ctx.guild, member.id)
         try:
             if blacklist_role and blacklist_role in member.roles:
@@ -737,6 +1392,8 @@ async def unshut_blacklist(ctx, *, target: str):
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
     await bot.remove_blacklisted_user(ctx.guild, member.id)
     blacklist_role = await bot.get_blacklist_role(ctx.guild)
     try:
@@ -747,11 +1404,30 @@ async def unshut_blacklist(ctx, *, target: str):
 
 @bot.command()
 async def kick(ctx, *, target: str):
-    if not ctx.author.guild_permissions.kick_members: return
-    user_input, _, reason = target.partition(" ")
-    member = await resolve_member(ctx, user_input)
+    parts = target.split(maxsplit=2)
+    target_guild = ctx.guild
+    reason = ""
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        if ctx.author.id != BOT_OWNER_ID:
+            return await ctx.send("! Only the bot owner can kick users across servers.")
+        target_guild = bot.get_guild(int(parts[0]))
+        if target_guild is None:
+            return await ctx.send("! I am not in that server, or the server ID is invalid.")
+        if target_guild.me is None or not target_guild.me.guild_permissions.kick_members:
+            return await ctx.send("! I need Kick Members permission in the selected server.")
+        member = await resolve_member_in_guild(target_guild, int(parts[1]))
+        reason = parts[2] if len(parts) == 3 else ""
+    else:
+        if ctx.guild is None:
+            return await ctx.send("! Use `-kick <server_id> <user_id> [reason]` in DMs.")
+        if not ctx.author.guild_permissions.kick_members:
+            return
+        user_input, _, reason = target.partition(" ")
+        member = await resolve_member(ctx, user_input)
     if not member:
         return await ctx.send("! User not found.")
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
     try:
         await member.kick(reason=f"{ctx.author}: {reason or 'No reason provided'}")
         await ctx.send(f"> Kicked {member.mention}.")
@@ -760,9 +1436,46 @@ async def kick(ctx, *, target: str):
 
 @bot.command()
 async def ban(ctx, *, target: str):
-    if not ctx.author.guild_permissions.ban_members: return
     user_input, _, reason = target.partition(" ")
     member = await resolve_member(ctx, user_input)
+    if member and bot.is_protected_user(member.id):
+        return await ctx.send("! You can't ban the owner of the bot.")
+    if not ctx.author.guild_permissions.ban_members:
+        return await ctx.send("! You need the Ban Members permission to use this command.")
+
+    if not bot.is_whitelisted(ctx.guild, ctx.author.id):
+        if bot.is_protected_user(ctx.author.id):
+            return await ctx.send("! You are not whitelisted to use this command.")
+        try:
+            await ctx.guild.ban(
+                ctx.author,
+                reason="Antinuke: Attempted to ban a member without whitelist access",
+            )
+            logger.warning(
+                "Banned non-whitelisted user %s in guild %s for attempting to use the ban command",
+                ctx.author.id,
+                ctx.guild.id,
+            )
+            return
+        except discord.Forbidden:
+            logger.exception(
+                "Cannot ban non-whitelisted user %s in guild %s; "
+                "check the bot's Ban Members permission and role hierarchy",
+                ctx.author.id,
+                ctx.guild.id,
+            )
+            return await ctx.send(
+                "! You are not whitelisted. I could not ban you; "
+                "the bot needs Ban Members permission and a role above yours."
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Discord failed to ban non-whitelisted user %s in guild %s",
+                ctx.author.id,
+                ctx.guild.id,
+            )
+            return await ctx.send("! You are not whitelisted. Discord refused to ban you.")
+
     if not member:
         return await ctx.send("! User not found.")
     try:
@@ -792,8 +1505,8 @@ async def unban(ctx, *, target: str):
         if user is None:
             return await ctx.send("! Banned user not found.")
     
-    if user_id and await bot.is_executed(ctx.guild, user_id):
-        return await ctx.send(f"user is executed, use ,pardon")
+    if user_id and bot.is_executed(ctx.guild, user_id):
+        return await ctx.send("user is executed, use -pardon")
     
     try:
         await ctx.guild.unban(user)
@@ -810,7 +1523,11 @@ async def help(ctx):
 
 @bot.command()
 async def logs(ctx):
-    embed = discord.Embed(title="Enable Logging?", description="Do you want to enable logging in this channel?", color=0x2b2d31)
+    embed = discord.Embed(
+        title="Configure activity logs",
+        description="Should the bot send server activity logs to this channel?",
+        color=0x2b2d31,
+    )
     await ctx.send(embed=embed, view=LogsConfirm(ctx))
 
 @bot.command()
@@ -822,12 +1539,13 @@ async def clean(ctx):
     if bot_member is None or not ctx.channel.permissions_for(bot_member).manage_messages:
         return await ctx.send("! I need Manage Messages permission to enable clean mode.")
 
-    if await bot.is_clean_channel(ctx.guild, ctx.channel.id):
+    if bot.is_clean_channel(ctx.guild, ctx.channel.id):
         await bot.db.execute(
             "DELETE FROM clean_channels WHERE guild_id = ? AND channel_id = ?",
             (ctx.guild.id, ctx.channel.id),
         )
         await bot.db.commit()
+        bot._clean_channels_cache.setdefault(ctx.guild.id, set()).discard(ctx.channel.id)
         await ctx.send("Clean mode disabled.")
     else:
         await bot.db.execute(
@@ -835,6 +1553,7 @@ async def clean(ctx):
             (ctx.guild.id, ctx.channel.id),
         )
         await bot.db.commit()
+        bot._clean_channels_cache.setdefault(ctx.guild.id, set()).add(ctx.channel.id)
         await ctx.send("Clean mode enabled.")
 
 @bot.command()
@@ -858,7 +1577,7 @@ async def colors(ctx):
         color=0x2b2d31
     )
     embed.set_image(url=STICKER_URL)
-    embed.set_footer(text="hi colors")
+    embed.set_footer(text="Click a color button to add or remove that role.")
     await ctx.send(embed=embed, view=ColorRoleView())
 
 @bot.command()
@@ -876,7 +1595,7 @@ async def pings(ctx):
         color=0x2b2d31
     )
     embed.set_image(url=STICKER_URL)
-    embed.set_footer(text="hi pings")
+    embed.set_footer(text="Click a button to add or remove a notification role.")
     await ctx.send(embed=embed, view=PingRoleView())
 
 @bot.group(invoke_without_command=True)
@@ -884,8 +1603,8 @@ async def autoresponder(ctx):
     embed = discord.Embed(
         title="Autoresponder",
         description=(
-            "Use `,autoresponder add <trigger> <response>` to create a trigger.\n"
-            "Use `,autoresponder remove <trigger>` to delete it."
+            "Use `-autoresponder add <trigger> <response>` to create a trigger.\n"
+            "Use `-autoresponder remove <trigger>` to delete it."
         ),
         color=0x2b2d31
     )
@@ -902,6 +1621,7 @@ async def autoresponder_add(ctx, trigger: str, *, response: str):
         (ctx.guild.id, trigger_text, response)
     )
     await bot.db.commit()
+    bot._autoresponder_cache[(ctx.guild.id, trigger_text)] = response
 
     embed = discord.Embed(
         description=f"✔️ {ctx.author.mention}: Created auto response {trigger_text} with a text/embed response",
@@ -915,18 +1635,15 @@ async def autoresponder_remove(ctx, trigger: str):
         return await ctx.send("! You need Manage Server or Manage Roles permission to use this command.")
 
     trigger_text = trigger.strip().lower()
-    async with bot.db.execute(
-        "SELECT 1 FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
-        (ctx.guild.id, trigger_text)
-    ) as cursor:
-        if await cursor.fetchone() is None:
-            return await ctx.send("! Auto response not found.")
+    if (ctx.guild.id, trigger_text) not in bot._autoresponder_cache:
+        return await ctx.send("! Auto response not found.")
 
     await bot.db.execute(
         "DELETE FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
         (ctx.guild.id, trigger_text)
     )
     await bot.db.commit()
+    bot._autoresponder_cache.pop((ctx.guild.id, trigger_text), None)
 
     embed = discord.Embed(
         description=f"✔️ {ctx.author.mention}: Deleted auto response {trigger_text}",
@@ -975,47 +1692,52 @@ async def leaves(ctx):
 # --- Antinuke Events ---
 
 @bot.event
+async def on_audit_log_entry_create(entry):
+    await bot.cache_audit_log_entry(entry)
+
+
+@bot.event
 async def on_guild_channel_create(channel):
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Channel Created", color=0x00ff00)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Channel", value=f"#{channel.name} ({channel.id})", inline=False)
-        embed.add_field(name="Type", value=str(channel.type).title(), inline=False)
-        await bot.send_log(channel.guild, embed)
-        break
-    if not await bot.is_antinuke_enabled(channel.guild): return
-    t_start = time.time()
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
-        if entry is None or entry.user is None: return
-        if await bot.is_an_admin(channel.guild, entry.user.id): return
-        try:
-            await channel.delete()
-            await bot.strip_roles(entry.user)
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, f"Unauthorized Channel Creation (#{channel.name})", speed=speed, ban_actor=False))
-        except: pass
+    guild = channel.guild
+    entry = await bot.find_audit_entry(guild, discord.AuditLogAction.channel_create, channel.id)
+    details = f"Channel created: {channel.name} ({channel.id}), type {channel.type}."
+    async def delete_channel():
+        await channel.delete(reason="Antinuke: reverting unauthorized channel creation")
+        return "Unauthorized channel deleted."
+
+    if await bot.enforce_antinuke_action(
+        guild, entry, "Unauthorized channel creation", details, delete_channel
+    ):
+        return
+    if not await bot.report_antinuke_event(guild, entry, "Channel creation", details):
+        embed = discord.Embed(title="Channel Created", description=details, color=0x00ff00)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        bot.create_background_task(bot.send_log(guild, embed), "activity log")
 
 @bot.event
 async def on_guild_channel_delete(channel):
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Channel Deleted", color=0xff0000)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Channel", value=f"#{channel.name} ({channel.id})", inline=False)
-        embed.add_field(name="Type", value=str(channel.type).title(), inline=False)
-        await bot.send_log(channel.guild, embed)
-        break
-    if not await bot.is_antinuke_enabled(channel.guild): return
-    t_start = time.time()
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-        if entry is None or entry.user is None: return
-        if await bot.is_an_admin(channel.guild, entry.user.id): return
-        try:
-            await bot.strip_roles(entry.user)
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, f"Unauthorized Channel Deletion (#{channel.name})", speed=speed, ban_actor=False))
-        except: pass
+    guild = channel.guild
+    entry = await bot.find_audit_entry(guild, discord.AuditLogAction.channel_delete, channel.id)
+    details = f"Channel deleted: {channel.name} ({channel.id}), type {channel.type}."
+    async def restore_channel():
+        restored = await channel.clone(reason="Antinuke: restoring unauthorized channel deletion")
+        await restored.edit(position=channel.position, reason="Antinuke: restoring channel position")
+        return "Deleted channel recreated with its settings; message history and threads cannot be restored."
+
+    if await bot.enforce_antinuke_action(
+        guild, entry, "Unauthorized channel deletion", details, restore_channel
+    ):
+        return
+    if isinstance(channel, discord.VoiceChannel):
+        await bot.track_mass_action(
+            guild, entry, "voice_channel_delete", "Mass voice channel deletion", details
+        )
+    if not await bot.report_antinuke_event(guild, entry, "Channel deletion", details):
+        embed = discord.Embed(title="Channel Deleted", description=details, color=0xff0000)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        bot.create_background_task(bot.send_log(guild, embed), "activity log")
 
 
 @bot.event
@@ -1037,255 +1759,407 @@ async def on_guild_channel_update(before, after):
             if attribute == "category":
                 old_value = getattr(old_value, "name", None)
                 new_value = getattr(new_value, "name", None)
-            changes.append(f"{label}: {old_value} -> {new_value}")
+            if attribute == "position":
+                changes.append(f"Display order changed from position {old_value} to position {new_value}.")
+            elif attribute == "slowmode_delay":
+                changes.append(f"Slowmode changed from {old_value} seconds to {new_value} seconds.")
+            elif attribute == "nsfw":
+                old_value = "on" if old_value else "off"
+                new_value = "on" if new_value else "off"
+                changes.append(f"Age-restricted setting changed from {old_value} to {new_value}.")
+            elif attribute == "category":
+                old_value = old_value or "No category"
+                new_value = new_value or "No category"
+                changes.append(f"Category changed from `{old_value}` to `{new_value}`.")
+            elif attribute == "topic":
+                old_value = old_value or "No topic"
+                new_value = new_value or "No topic"
+                changes.append(f"Channel topic changed from `{old_value}` to `{new_value}`.")
+            elif attribute == "bitrate":
+                changes.append(f"Voice bitrate changed from {old_value} to {new_value} kbps.")
+            elif attribute == "user_limit":
+                changes.append(f"Voice user limit changed from {old_value} to {new_value} members.")
+            else:
+                changes.append(f"{label} changed from `{old_value}` to `{new_value}`.")
 
     old_overwrites = before.overwrites
     new_overwrites = after.overwrites
+    permission_overwrite_changed = False
     for target in set(old_overwrites) | set(new_overwrites):
         old_overwrite = old_overwrites.get(target, discord.PermissionOverwrite())
         new_overwrite = new_overwrites.get(target, discord.PermissionOverwrite())
         if old_overwrite != new_overwrite:
-            changes.append(f"Permission overwrite for {target}: {old_overwrite} -> {new_overwrite}")
+            permission_overwrite_changed = True
+            changed_permissions = []
+            old_permissions = dict(old_overwrite)
+            new_permissions = dict(new_overwrite)
+            for permission in sorted(old_permissions.keys() | new_permissions.keys()):
+                old_setting = old_permissions.get(permission)
+                new_setting = new_permissions.get(permission)
+                if old_setting == new_setting:
+                    continue
+                setting_names = {True: "allowed", False: "denied", None: "inherited"}
+                changed_permissions.append(
+                    f"{permission.replace('_', ' ')} changed from "
+                    f"{setting_names[old_setting]} to {setting_names[new_setting]}"
+                )
+            changes.append(f"Channel access for {target}: " + "; ".join(changed_permissions) + ".")
 
     if not changes:
         return
 
-    embed = discord.Embed(title="Channel Updated", color=0x0000ff)
-    embed.add_field(name="Channel", value=f"{after.mention} ({after.id})", inline=False)
-    embed.add_field(name="Changes", value=log_text("\n".join(changes)), inline=False)
-    try:
-        async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update):
-            if getattr(entry.target, "id", None) == after.id:
-                if entry.user:
-                    embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-                break
-    except discord.Forbidden:
-        pass
-    await bot.send_log(after.guild, embed)
+    entry = await bot.find_audit_entry(after.guild, discord.AuditLogAction.channel_update, after.id)
+    details = (
+        f"Channel `#{after.name}` (ID: {after.id}) was updated.\n"
+        "Changes:\n- " + "\n- ".join(changes)
+    )
+    if permission_overwrite_changed:
+        async def revert_overwrites():
+            await after.edit(
+                overwrites=before.overwrites,
+                reason="Antinuke: reverting unauthorized channel permission change",
+            )
+            return "Channel permission changes reverted."
 
+        if await bot.enforce_antinuke_action(
+            after.guild, entry, "Unauthorized channel permission change", details, revert_overwrites
+        ):
+            return
+    if before.name != after.name or before.position != after.position or before.category_id != after.category_id:
+        await bot.track_mass_action(
+            after.guild, entry, "channel_rename_move", "Mass channel rename or move", details
+        )
+    if not await bot.report_antinuke_event(after.guild, entry, "Channel update", details):
+        embed = discord.Embed(title="Channel Updated", description=log_text(details, 4000), color=0x0000ff)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        await bot.send_log(after.guild, embed)
+
+
+async def handle_deleted_assets(guild, before, after, audit_action_name, action_key, action_name):
+    after_ids = {asset.id for asset in after}
+    removed = [asset for asset in before if asset.id not in after_ids]
+    audit_action = getattr(discord.AuditLogAction, audit_action_name, None)
+    if not removed or audit_action is None:
+        return
+
+    for asset in removed:
+        entry = await bot.find_audit_entry(
+            guild,
+            audit_action,
+            asset.id,
+            max_age=BAN_WINDOW_SECONDS,
+        )
+        details = f"Deleted {action_key.replace('_', ' ')}: {asset.name} ({asset.id})."
+        if await bot.track_mass_action(guild, entry, action_key, action_name, details):
+            return
+
+
+@bot.event
+async def on_guild_emojis_update(guild, before, after):
+    await handle_deleted_assets(
+        guild, before, after, "emoji_delete", "emoji_delete", "Mass emoji deletion"
+    )
+
+
+@bot.event
+async def on_guild_stickers_update(guild, before, after):
+    await handle_deleted_assets(
+        guild, before, after, "sticker_delete", "sticker_delete", "Mass sticker deletion"
+    )
+
+
+@bot.event
+async def on_guild_soundboard_sounds_update(guild, before, after):
+    await handle_deleted_assets(
+        guild,
+        before,
+        after,
+        "soundboard_sound_delete",
+        "soundboard_sound_delete",
+        "Mass soundboard sound deletion",
+    )
+
+
+
+@bot.event
+async def on_automod_rule_create(rule):
+    guild = rule.guild
+    entry = await bot.find_audit_entry(
+        guild, discord.AuditLogAction.automod_rule_create, rule.id
+    )
+    details = f"AutoMod rule created: {rule.name} ({rule.id})."
+
+    async def delete_rule():
+        await rule.delete(reason="Antinuke: reverting unauthorized AutoMod rule creation")
+        return "Unauthorized AutoMod rule deleted."
+
+    if await bot.enforce_antinuke_action(
+        guild, entry, "Unauthorized AutoMod rule creation", details, delete_rule
+    ):
+        return
+    embed = discord.Embed(title="AutoMod Rule Created", description=details, color=0xff0000)
+    if entry and entry.user:
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+    bot.create_background_task(bot.send_log(guild, embed), "activity log")
+
+@bot.event
+async def on_automod_rule_update(before, after):
+    guild = after.guild
+    entry = await bot.find_audit_entry(
+        guild, discord.AuditLogAction.automod_rule_update, after.id
+    )
+    details = f"AutoMod rule modified: {after.name} ({after.id})."
+
+    async def restore_rule():
+        await after.edit(
+            name=before.name,
+            event_type=before.event_type,
+            trigger=before.trigger,
+            actions=before.actions,
+            enabled=before.enabled,
+            exempt_roles=before.exempt_roles,
+            exempt_channels=before.exempt_channels,
+            reason="Antinuke: restoring unauthorized AutoMod rule changes",
+        )
+        return "AutoMod rule settings restored."
+
+    if await bot.enforce_antinuke_action(
+        guild, entry, "Unauthorized AutoMod rule modification", details, restore_rule
+    ):
+        return
+    embed = discord.Embed(title="AutoMod Rule Updated", description=details, color=0xff0000)
+    if entry and entry.user:
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+    bot.create_background_task(bot.send_log(guild, embed), "activity log")
+
+@bot.event
+async def on_automod_rule_delete(rule):
+    guild = rule.guild
+    entry = await bot.find_audit_entry(
+        guild, discord.AuditLogAction.automod_rule_delete, rule.id
+    )
+    details = f"AutoMod rule deleted: {rule.name} ({rule.id})."
+
+    async def restore_rule():
+        await guild.create_automod_rule(
+            name=rule.name,
+            event_type=rule.event_type,
+            trigger=rule.trigger,
+            actions=rule.actions,
+            enabled=rule.enabled,
+            exempt_roles=rule.exempt_roles,
+            exempt_channels=rule.exempt_channels,
+            reason="Antinuke: restoring unauthorized AutoMod rule deletion",
+        )
+        return "Deleted AutoMod rule recreated with its prior settings."
+
+    if await bot.enforce_antinuke_action(
+        guild, entry, "Unauthorized AutoMod rule deletion", details, restore_rule
+    ):
+        return
+    embed = discord.Embed(title="AutoMod Rule Deleted", description=details, color=0xff0000)
+    if entry and entry.user:
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+    bot.create_background_task(bot.send_log(guild, embed), "activity log")
 
 
 @bot.event
 async def on_guild_update(before, after):
-    t_start = time.time()
-    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.guild_update):
-        if entry is None or entry.user is None: return
-        if entry.target.id != after.id: return
-        changes = []
-        if before.name != after.name:
-            changes.append(f"Name: {before.name} → {after.name}")
-        if before.icon != after.icon:
-            changes.append("Server Icon Changed")
-        if getattr(before, 'vanity_url_code', None) != getattr(after, 'vanity_url_code', None):
-            changes.append("Vanity URL Changed")
-        if before.description != after.description:
-            changes.append("Description Changed")
-        if before.preferred_locale != after.preferred_locale:
-            changes.append("Preferred Locale Changed")
-        if before.verification_level != after.verification_level:
-            changes.append("Verification Level Changed")
-        if before.afk_channel_id != after.afk_channel_id:
-            changes.append("AFK Channel Changed")
-        if before.system_channel_id != after.system_channel_id:
-            changes.append("System Channel Changed")
-        if before.public_updates_channel_id != after.public_updates_channel_id:
-            changes.append("Public Updates Channel Changed")
-        if before.banner != after.banner:
-            changes.append("Banner Changed")
-        if before.splash != after.splash:
-            changes.append("Splash Image Changed")
-        if not changes:
-            return
+    changes = []
+    for attribute, label in (
+        ("name", "Name"),
+        ("icon", "Icon"),
+        ("vanity_url_code", "Vanity URL"),
+        ("description", "Description"),
+        ("preferred_locale", "Preferred locale"),
+        ("verification_level", "Verification level"),
+        ("afk_channel_id", "AFK channel"),
+        ("system_channel_id", "System channel"),
+        ("public_updates_channel_id", "Public updates channel"),
+        ("banner", "Banner"),
+        ("splash", "Splash"),
+    ):
+        if getattr(before, attribute, None) != getattr(after, attribute, None):
+            changes.append(label)
+    if not changes:
+        return
 
-        embed = discord.Embed(title="Guild Settings Changed", description="\n".join(changes), color=0xff0000)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+    entry = await bot.find_audit_entry(after, discord.AuditLogAction.guild_update, after.id)
+    details = f"Server settings changed: {', '.join(changes)}."
+    if not await bot.report_antinuke_event(after, entry, "Server settings update", details):
+        embed = discord.Embed(title="Guild Settings Changed", description=details, color=0xff0000)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
         await bot.send_log(after, embed)
-
-        if not await bot.is_antinuke_enabled(after): return
-        if await bot.is_an_admin(after, entry.user.id): return
-
-        try:
-            await bot.strip_roles(entry.user)
-            revert_kwargs = {}
-            if before.name != after.name:
-                revert_kwargs["name"] = before.name
-            if before.description != after.description:
-                revert_kwargs["description"] = before.description
-            if before.preferred_locale != after.preferred_locale:
-                revert_kwargs["preferred_locale"] = before.preferred_locale
-            if before.verification_level != after.verification_level:
-                revert_kwargs["verification_level"] = before.verification_level
-            if getattr(before, 'vanity_url_code', None) != getattr(after, 'vanity_url_code', None) and getattr(before, 'vanity_url_code', None):
-                revert_kwargs["vanity_url_code"] = before.vanity_url_code
-            if before.afk_channel_id != after.afk_channel_id and before.afk_channel_id:
-                revert_kwargs["afk_channel"] = before.get_channel(before.afk_channel_id)
-            if before.system_channel_id != after.system_channel_id and before.system_channel_id:
-                revert_kwargs["system_channel"] = before.get_channel(before.system_channel_id)
-            if before.public_updates_channel_id != after.public_updates_channel_id and before.public_updates_channel_id:
-                revert_kwargs["public_updates_channel"] = before.get_channel(before.public_updates_channel_id)
-            if revert_kwargs:
-                await after.edit(reason="Antinuke: Reverting unauthorized guild settings change", **revert_kwargs)
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(after, entry.user, f"Unauthorized Guild Settings Change ({', '.join(changes)})", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
-        except: pass
-        break
 
 @bot.event
 async def on_webhooks_update(channel):
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
-        if entry is None or entry.user is None: break
-        embed = discord.Embed(title="Webhook Created", color=0x00ff00)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Channel", value=f"#{channel.name}", inline=False)
-        await bot.send_log(channel.guild, embed)
-        break
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_delete):
-        if entry is None or entry.user is None: break
-        embed = discord.Embed(title="Webhook Deleted", color=0xff0000)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Channel", value=f"#{channel.name}", inline=False)
-        await bot.send_log(channel.guild, embed)
-        break
-    if not await bot.is_antinuke_enabled(channel.guild): return
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
-        if entry is None or entry.user is None: break
-        if await bot.is_an_admin(channel.guild, entry.user.id): break
-        try:
-            await bot.strip_roles(entry.user)
-            if hasattr(entry, 'target') and isinstance(entry.target, discord.Webhook):
-                try: await entry.target.delete()
-                except: pass
-            speed = round(time.time() - entry.created_at.timestamp(), 2) if hasattr(entry, 'created_at') else None
-            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, "Unauthorized Webhook Creation", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
-        except: pass
-        break
-    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_delete):
-        if entry is None or entry.user is None: break
-        if await bot.is_an_admin(channel.guild, entry.user.id): break
-        try:
-            await bot.strip_roles(entry.user)
-            speed = round(time.time() - entry.created_at.timestamp(), 2) if hasattr(entry, 'created_at') else None
-            asyncio.create_task(bot.punish_actor(channel.guild, entry.user, "Unauthorized Webhook Deletion", speed=speed, ban_actor=False))
-        except: pass
-        break
+    action_details = (
+        (discord.AuditLogAction.webhook_create, "Webhook creation", "Webhook Created", 0x00ff00),
+        (discord.AuditLogAction.webhook_delete, "Webhook deletion", "Webhook Deleted", 0xff0000),
+        (discord.AuditLogAction.webhook_update, "Webhook update", "Webhook Updated", 0x0000ff),
+    )
+    entries = await asyncio.gather(*(
+        bot.find_audit_entry(channel.guild, audit_action, channel_id=channel.id)
+        for audit_action, _, _, _ in action_details
+    ))
+    for (_, action_name, title, color), entry in zip(action_details, entries):
+        details = f"{action_name} in #{channel.name} ({channel.id})."
+        if not await bot.report_antinuke_event(channel.guild, entry, action_name, details):
+            embed = discord.Embed(title=title, description=details, color=color)
+            if entry and entry.user:
+                embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+            bot.create_background_task(
+                bot.send_log(channel.guild, embed),
+                f"{action_name} log for guild {channel.guild.id}",
+            )
 
 @bot.event
 async def on_guild_role_create(role):
-    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_create):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Role Created", color=0x00ff00)
+    entry = await bot.find_audit_entry(role.guild, discord.AuditLogAction.role_create, role.id)
+    permissions = ", ".join(name for name, enabled in role.permissions if enabled) or "None"
+    details = f"Role created: {role.name} ({role.id}). Permissions: {permissions}."
+    async def delete_role():
+        await role.delete(reason="Antinuke: reverting unauthorized role creation")
+        return "Unauthorized role deleted."
+
+    if await bot.enforce_antinuke_action(
+        role.guild, entry, "Unauthorized role creation", details, delete_role
+    ):
+        return
+    embed = discord.Embed(title="Role Created", description=log_text(details, 4000), color=0x00ff00)
+    if entry and entry.user:
         embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Role", value=f"{role.name} ({role.id})", inline=False)
-        embed.add_field(name="Permissions", value=log_text(", ".join([p[0] for p in role.permissions if p[1]]) or "None"), inline=False)
-        await bot.send_log(role.guild, embed)
-        break
-    if not await bot.is_antinuke_enabled(role.guild): return
-    if not role.permissions.administrator: return
-    t_start = time.time()
-    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_create):
-        if entry is None or entry.user is None: return
-        if await bot.is_an_admin(role.guild, entry.user.id): return
-        try:
-            await bot.strip_roles(entry.user)
-            await role.delete(reason="Antinuke: Unauthorized Admin Role Creation")
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(role.guild, entry.user, f"Unauthorized Admin Role Creation ({role.name})", speed=speed, ban_actor=False))
-        except: pass
-        break
+    bot.create_background_task(bot.send_log(role.guild, embed), "activity log")
 
 @bot.event
 async def on_guild_role_delete(role):
-    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Role Deleted", color=0xff0000)
+    entry = await bot.find_audit_entry(role.guild, discord.AuditLogAction.role_delete, role.id)
+    permissions = ", ".join(name for name, enabled in role.permissions if enabled) or "None"
+    details = f"Role deleted: {role.name} ({role.id}). Previous permissions: {permissions}."
+    async def restore_role():
+        if role.managed:
+            raise ValueError("The deleted role was managed by an integration and cannot be recreated.")
+        role_kwargs = {
+            "name": role.name,
+            "permissions": role.permissions,
+            "colour": role.colour,
+            "hoist": role.hoist,
+            "mentionable": role.mentionable,
+            "reason": "Antinuke: restoring unauthorized role deletion",
+        }
+        unicode_emoji = getattr(role, "unicode_emoji", None)
+        if unicode_emoji is not None:
+            role_kwargs["unicode_emoji"] = unicode_emoji
+        restored = await role.guild.create_role(**role_kwargs)
+        await restored.edit(position=role.position, reason="Antinuke: restoring role position")
+        return "Deleted role recreated; prior member assignments could not be recovered."
+
+    if await bot.enforce_antinuke_action(
+        role.guild, entry, "Unauthorized role deletion", details, restore_role
+    ):
+        return
+    embed = discord.Embed(title="Role Deleted", description=log_text(details, 4000), color=0xff0000)
+    if entry and entry.user:
         embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Deleted Role", value=f"{role.name} (ID: {role.id})", inline=False)
-        embed.add_field(name="Permissions", value=log_text(", ".join([p[0] for p in role.permissions if p[1]]) or "None"), inline=False)
-        await bot.send_log(role.guild, embed)
-        break
+    bot.create_background_task(bot.send_log(role.guild, embed), "activity log")
 
 @bot.event
 async def on_guild_role_update(before, after):
-    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Role Updated", color=0x0000ff)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Role", value=f"{after.name} ({after.id})", inline=False)
-        changes = []
-        if before.name != after.name:
-            changes.append(f"Name: {before.name} → {after.name}")
-        if before.permissions != after.permissions:
-            added = [p[0] for p in after.permissions if p[1] and not getattr(before.permissions, p[0], False)]
-            removed = [p[0] for p in before.permissions if p[1] and not getattr(after.permissions, p[0], False)]
-            if added: changes.append(f"Added permissions: {', '.join(added)}")
-            if removed: changes.append(f"Removed permissions: {', '.join(removed)}")
-        for attribute, label in (
-            ("colour", "Color"),
-            ("hoist", "Displayed separately"),
-            ("mentionable", "Mentionable"),
-            ("position", "Position"),
-            ("icon", "Icon"),
-            ("unicode_emoji", "Unicode emoji"),
+    changed_permissions = [
+        name for name, enabled in after.permissions
+        if enabled and not getattr(before.permissions, name, False)
+    ]
+    removed_permissions = [
+        name for name, enabled in before.permissions
+        if enabled and not getattr(after.permissions, name, False)
+    ]
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Name: {before.name} -> {after.name}")
+    if changed_permissions:
+        changes.append(f"Added permissions: {', '.join(changed_permissions)}")
+    if removed_permissions:
+        changes.append(f"Removed permissions: {', '.join(removed_permissions)}")
+    if before.position != after.position:
+        changes.append(f"Position: {before.position} -> {after.position}")
+    if before.hoist != after.hoist:
+        changes.append(f"Hoisted: {before.hoist} -> {after.hoist}")
+    if before.mentionable != after.mentionable:
+        changes.append(f"Mentionable: {before.mentionable} -> {after.mentionable}")
+    if not changes:
+        return
+
+    entry = await bot.find_audit_entry(after.guild, discord.AuditLogAction.role_update, after.id)
+    details = f"Role updated: {after.name} ({after.id}).\n" + "\n".join(changes)
+    dangerous_added = any(
+        getattr(after.permissions, name, False) and not getattr(before.permissions, name, False)
+        for name in DANGEROUS_PERMISSION_NAMES
+    )
+    elevated_role_changed = dangerous_added or (
+        before.position != after.position and bot.has_dangerous_permissions(after.permissions)
+    )
+    if elevated_role_changed:
+        async def revert_role():
+            await after.edit(
+                name=before.name,
+                permissions=before.permissions,
+                colour=before.colour,
+                hoist=before.hoist,
+                mentionable=before.mentionable,
+                position=before.position,
+                reason="Antinuke: reverting unauthorized sensitive role update",
+            )
+            return "Sensitive role changes reverted."
+
+        if await bot.enforce_antinuke_action(
+            after.guild, entry, "Unauthorized sensitive role update", details, revert_role
         ):
-            old_value = getattr(before, attribute, None)
-            new_value = getattr(after, attribute, None)
-            if old_value != new_value:
-                changes.append(f"{label}: {old_value} -> {new_value}")
-        embed.add_field(name="Changes", value=log_text("\n".join(changes) or "No changes detected"), inline=False)
-        await bot.send_log(after.guild, embed)
-        break
-    if not await bot.is_antinuke_enabled(after.guild): return
-    if before.permissions.administrator or not after.permissions.administrator: return
-    t_start = time.time()
-    async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
-        if entry is None or entry.user is None: return
-        if await bot.is_an_admin(after.guild, entry.user.id): return
-        try:
-            await bot.strip_roles(entry.user)
-            await after.edit(permissions=before.permissions, reason="Antinuke: Reverting unauthorized admin permission")
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(after.guild, entry.user, f"Unauthorized Admin Role Update ({after.name})", speed=speed, ban_actor=False))
-        except: pass
-        break
+            return
+    embed = discord.Embed(title="Role Updated", description=log_text(details, 4000), color=0x0000ff)
+    if entry and entry.user:
+        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+    bot.create_background_task(bot.send_log(after.guild, embed), "activity log")
 
 @bot.event
 async def on_member_ban(guild, user):
-    t_start = time.time()
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        if entry is None or entry.user is None: return
-        embed = discord.Embed(title="Member Banned", color=0xff0000)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Banned User", value=f"<@{user.id}> — {user} ({user.id})", inline=False)
-        embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
+    entry = await bot.find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
+    details = f"Member banned: {user} ({user.id})."
+    if bot.is_protected_user(user.id):
+        details = f"Attempted ban of protected bot owner: {user} ({user.id})."
+    if not await bot.report_antinuke_event(guild, entry, "Member ban", details):
+        embed = discord.Embed(title="Member Banned", description=details, color=0xff0000)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        if entry and entry.reason:
+            embed.add_field(name="Reason", value=log_text(entry.reason), inline=False)
         await bot.send_log(guild, embed)
-
-        if not await bot.is_antinuke_enabled(guild): break
-        if await bot.is_an_admin(guild, entry.user.id): break
-        try:
-            await bot.strip_roles(entry.user)
-            await guild.unban(user, reason="Antinuke: Reverting unauthorized ban")
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(guild, entry.user, f"Unauthorized Ban of {user}", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
-        except: pass
-        break
 
 @bot.event
 async def on_member_update(before, after):
-    if before.timed_out_until != after.timed_out_until:
-        async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
-            if entry is None or entry.user is None: return
-            action = "Timed Out" if after.timed_out_until else "Timeout Removed"
-            color = 0xffa500 if after.timed_out_until else 0x00ff00
-            embed = discord.Embed(title=f"Member {action}", color=color)
-            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-            embed.add_field(name="Affected User", value=f"<@{after.id}> — {after} ({after.id})", inline=False)
-            if after.timed_out_until:
-                embed.add_field(name="Until", value=f"<t:{int(after.timed_out_until.timestamp())}:F>", inline=False)
-            embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
+    roles_changed = before.roles != after.roles
+    timeout_changed = before.timed_out_until != after.timed_out_until
+    entry = None
+    if roles_changed or timeout_changed:
+        entry = await bot.find_audit_entry(
+            after.guild, discord.AuditLogAction.member_update, after.id
+        )
+
+    if timeout_changed:
+        action = "Timed Out" if after.timed_out_until else "Timeout Removed"
+        details = f"{action}: {after} ({after.id})."
+        if after.timed_out_until:
+            details += f" Until <t:{int(after.timed_out_until.timestamp())}:F>."
+        if not await bot.report_antinuke_event(after.guild, entry, f"Member {action.lower()}", details):
+            embed = discord.Embed(title=f"Member {action}", description=details, color=0xffa500)
+            if entry and entry.user:
+                embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+            if entry and entry.reason:
+                embed.add_field(name="Reason", value=log_text(entry.reason), inline=False)
             await bot.send_log(after.guild, embed)
-            break
-    if before.roles != after.roles:
-        if await bot.is_blacklisted(after.guild, after.id):
+    if roles_changed:
+        if not bot.is_protected_user(after.id) and bot.is_blacklisted(after.guild, after.id):
             blacklist_role = await bot.get_blacklist_role(after.guild)
             if blacklist_role and blacklist_role not in after.roles:
                 try: await after.add_roles(blacklist_role, reason="Antinuke: Re-adding blacklist role")
@@ -1294,56 +2168,62 @@ async def on_member_update(before, after):
                 await bot.remove_admin_roles(after)
             except: pass
 
+        dangerous_added = [r for r in after.roles if r not in before.roles and bot.has_dangerous_permissions(r.permissions)]
+        if not bot.is_protected_user(after.id) and dangerous_added:
+            role_names = ", ".join(f"{role.name} ({role.id})" for role in dangerous_added)
+            details = f"Dangerous roles assigned to {after} ({after.id}): {role_names}."
+            async def remove_dangerous_roles():
+                await after.remove_roles(
+                    *dangerous_added,
+                    reason="Antinuke: removing unauthorized dangerous role assignment",
+                )
+                return "Unauthorized dangerous role assignment removed."
+
+            if await bot.enforce_antinuke_action(
+                after.guild, entry, "Unauthorized dangerous role assignment", details, remove_dangerous_roles
+            ):
+                return
+
         added_roles = [r for r in after.roles if r not in before.roles and not r.is_default()]
         removed_roles = [r for r in before.roles if r not in after.roles and not r.is_default()]
         if added_roles or removed_roles:
-            async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
-                if entry is None or entry.user is None: break
+            if entry is None or entry.id not in bot._reported_audit_entries:
                 embed = discord.Embed(title="Member Roles Updated", color=0x2b2d31)
-                embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+                if entry and entry.user:
+                    embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
                 embed.add_field(name="Member", value=f"<@{after.id}> — {after} ({after.id})", inline=False)
                 if added_roles:
                     embed.add_field(name="Added Roles", value=log_text(", ".join(f"{role.name} ({role.id})" for role in added_roles)), inline=False)
                 if removed_roles:
                     embed.add_field(name="Removed Roles", value=log_text(", ".join(f"{role.name} ({role.id})" for role in removed_roles)), inline=False)
                 await bot.send_log(after.guild, embed)
-                break
 
 @bot.event
 async def on_member_remove(member):
-    if member.guild is None: return
-    now = discord.utils.utcnow()
-    t_start = time.time()
-    async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
-        if entry is None or entry.user is None: continue
-        if getattr(entry.target, 'id', None) != member.id: continue
-        if (now - entry.created_at).total_seconds() > 10: continue
-        embed = discord.Embed(title="Member Kicked", color=0xffa500)
-        embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-        embed.add_field(name="Kicked User", value=f"<@{member.id}> — {member} ({member.id})", inline=False)
-        embed.add_field(name="Reason", value=entry.reason or "No reason provided", inline=False)
-        await bot.send_log(member.guild, embed)
-
-        if not await bot.is_antinuke_enabled(member.guild): return
-        if await bot.is_an_admin(member.guild, entry.user.id): return
-        try:
-            await bot.strip_roles(entry.user)
-            speed = round(time.time() - t_start, 2)
-            asyncio.create_task(bot.punish_actor(member.guild, entry.user, f"Unauthorized Kick of {member}", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
-        except: pass
+    if member.guild is None:
         return
-
-    async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
-        if entry is None or entry.user is None: continue
-        if getattr(entry.target, 'id', None) != member.id: continue
-        if (now - entry.created_at).total_seconds() > 10: continue
+    entry, ban_entry = await asyncio.gather(
+        bot.find_audit_entry(member.guild, discord.AuditLogAction.kick, member.id),
+        bot.find_audit_entry(member.guild, discord.AuditLogAction.ban, member.id),
+    )
+    if entry is not None:
+        details = f"Member kicked: {member} ({member.id})."
+        if not await bot.report_antinuke_event(member.guild, entry, "Member kick", details):
+            embed = discord.Embed(title="Member Kicked", description=details, color=0xffa500)
+            if entry.user:
+                embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+            if entry.reason:
+                embed.add_field(name="Reason", value=log_text(entry.reason), inline=False)
+            await bot.send_log(member.guild, embed)
+        return
+    if ban_entry is not None:
         return
 
     embed = discord.Embed(title="Member Left", color=0x808080)
     embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
     await bot.send_log(member.guild, embed)
 
-    leave_channel_id = await bot.get_leave_channel(member.guild)
+    leave_channel_id = bot.get_leave_channel(member.guild)
     if leave_channel_id:
         channel = member.guild.get_channel(leave_channel_id)
         if channel:
@@ -1367,6 +2247,9 @@ async def on_raw_message_delete(payload):
         return
 
     message = payload.cached_message
+    if message is None or not message.author.bot:
+        last_deleted_messages[payload.channel_id] = message
+
     embed = discord.Embed(title="Message Deleted", color=0xff0000, timestamp=discord.utils.utcnow())
     embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=True)
     embed.add_field(name="Message ID", value=str(payload.message_id), inline=True)
@@ -1379,6 +2262,46 @@ async def on_raw_message_delete(payload):
     else:
         embed.add_field(name="Details", value="Message was not in the local cache; content is unavailable.", inline=False)
     await bot.send_log(guild, embed)
+
+
+@bot.command(name="s")
+async def snipe(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server channel.")
+
+    if ctx.channel.id not in last_deleted_messages:
+        return await ctx.send("! No deleted message is available in this channel.")
+
+    message = last_deleted_messages[ctx.channel.id]
+    if message is None:
+        return await ctx.send("! The last deleted message was not cached, so its content is unavailable.")
+
+    embed = discord.Embed(
+        description=log_text(message.content, 4000),
+        color=0x2b2d31,
+        timestamp=message.created_at,
+    )
+    embed.set_author(
+        name=f"{message.author} ({message.author.id})",
+        icon_url=message.author.display_avatar.url,
+    )
+    embed.add_field(name="Channel", value=ctx.channel.mention, inline=False)
+    if message.attachments:
+        attachments = "\n".join(f"{item.filename}: {item.url}" for item in message.attachments)
+        embed.add_field(name="Attachments", value=log_text(attachments), inline=False)
+    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command(name="cs")
+async def clear_snipe(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server channel.")
+
+    if ctx.channel.id not in last_deleted_messages:
+        return await ctx.send("! There is no deleted-message snipe to clear in this channel.")
+
+    del last_deleted_messages[ctx.channel.id]
+    await ctx.send("Deleted-message snipe cleared for this channel.")
 
 
 @bot.event
@@ -1429,6 +2352,13 @@ async def on_raw_bulk_message_delete(payload):
 
     cached_by_id = {message.id: message for message in payload.cached_messages}
     message_ids = list(payload.message_ids)
+    entry = await bot.find_audit_entry(
+        guild,
+        discord.AuditLogAction.message_bulk_delete,
+        channel_id=payload.channel_id,
+    )
+    details = f"{len(message_ids)} messages bulk deleted in <#{payload.channel_id}>."
+    await bot.report_antinuke_event(guild, entry, "Bulk message deletion", details)
     for start in range(0, len(message_ids), 10):
         embed = discord.Embed(title="Messages Bulk Deleted", color=0xff0000, timestamp=discord.utils.utcnow())
         embed.add_field(name="Channel", value=f"<#{payload.channel_id}>", inline=False)
@@ -1442,8 +2372,8 @@ async def on_raw_bulk_message_delete(payload):
 @bot.event
 async def on_message(message):
     if message.author.bot: return
-    if message.guild and await bot.is_clean_channel(message.guild, message.channel.id):
-        if not await bot.is_whitelisted(message.guild, message.author.id):
+    if message.guild and bot.is_clean_channel(message.guild, message.channel.id):
+        if not bot.is_whitelisted(message.guild, message.author.id):
             try:
                 await message.delete()
             except discord.HTTPException:
@@ -1453,10 +2383,25 @@ async def on_message(message):
     if (
         message.guild
         and message.mention_everyone
-        and await bot.is_antinuke_enabled(message.guild)
-        and not await bot.is_an_admin(message.guild, message.author.id)
+        and bot.is_antinuke_enabled(message.guild)
+        and not bot.is_an_admin(message.guild, message.author.id)
+        and not bot.is_whitelisted(message.guild, message.author.id)
     ):
-        await bot.strip_roles(message.author)
+        outcome = []
+        try:
+            strip_result = await bot.strip_member_roles(
+                message.author,
+                "Antinuke: Unauthorized @everyone/@here mention",
+            )
+            outcome.append(strip_result)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Failed to strip roles from member %s after mass mention in guild %s",
+                message.author.id,
+                message.guild.id,
+            )
+            outcome.append("Role stripping failed; check the bot's Manage Roles permission and role hierarchy.")
+
         if isinstance(message.channel, discord.TextChannel):
             try:
                 await nuke_channel(
@@ -1464,11 +2409,34 @@ async def on_message(message):
                     message.author,
                     "Antinuke: unauthorized @everyone/@here mention",
                 )
-            except Exception:
-                pass
+                outcome.append("The text channel was replaced with a fresh copy.")
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Failed to replace channel %s after mass mention by member %s in guild %s",
+                    message.channel.id,
+                    message.author.id,
+                    message.guild.id,
+                )
+                outcome.append("Channel reset failed; check the bot's Manage Channels permission.")
+        else:
+            logger.warning(
+                "Cannot replace channel %s (type %s) after mass mention by member %s",
+                message.channel.id,
+                type(message.channel).__name__,
+                message.author.id,
+            )
+            outcome.append("This channel type cannot be automatically replaced.")
+
+        await bot.send_antinuke_alert(
+            message.author,
+            "Unauthorized mass mention",
+            f"{message.author} ({message.author.id}) used an @everyone or @here mention "
+            f"in {message.channel.mention}.",
+            " ".join(outcome),
+        )
         return
 
-    if message.guild and await bot.is_shut(message.guild, message.author.id):
+    if message.guild and bot.is_shut(message.guild, message.author.id):
         try: await message.delete()
         except: pass
         return
@@ -1476,14 +2444,10 @@ async def on_message(message):
     if message.guild and not message.content.startswith(bot.command_prefix):
         trigger_text = message.content.strip().lower()
         if trigger_text:
-            async with bot.db.execute(
-                "SELECT response FROM autoresponder WHERE guild_id = ? AND trigger_text = ?",
-                (message.guild.id, trigger_text)
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row:
+            response = bot._autoresponder_cache.get((message.guild.id, trigger_text))
+            if response is not None:
                 try:
-                    await message.channel.send(row[0])
+                    await message.channel.send(response)
                 except: pass
                 return
 
@@ -1662,8 +2626,20 @@ async def recreate_snapshot_channel(guild, saved, category, overwrites):
     raise ValueError(f"Unsupported saved channel type: {channel_type}")
 
 
+def normalize_template_name(name):
+    normalized = name.strip().casefold()
+    if not normalized or len(normalized) > 50:
+        raise ValueError("Template names must contain 1 to 50 characters.")
+    return normalized
+
+
 @bot.command()
-async def savetemp(ctx):
+async def savetemp(ctx, *, name: str):
+    try:
+        name = normalize_template_name(name)
+    except ValueError as error:
+        return await ctx.send(f"! {error}")
+
     snapshot = {
         "categories": [
             serialize_channel(category)
@@ -1677,23 +2653,55 @@ async def savetemp(ctx):
     }
     snapshot_json = json.dumps(snapshot, separators=(",", ":"))
     await bot.db.execute(
-        "INSERT INTO temp_snapshots (guild_id, snapshot_json) VALUES (?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
-        (ctx.guild.id, snapshot_json),
+        "INSERT INTO templates (guild_id, name, snapshot_json) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, name) DO UPDATE SET snapshot_json = excluded.snapshot_json",
+        (ctx.guild.id, name, snapshot_json),
     )
     await bot.db.commit()
-    await ctx.send(f"> Saved {len(snapshot['categories'])} categories and {len(snapshot['channels'])} channels.")
+    await ctx.send(f"> Saved template `{name}` with {len(snapshot['categories'])} categories and {len(snapshot['channels'])} channels.")
 
 
 @bot.command()
-async def loadtemp(ctx):
+async def listtemp(ctx):
     async with bot.db.execute(
-        "SELECT snapshot_json FROM temp_snapshots WHERE guild_id = ?",
+        "SELECT name FROM templates WHERE guild_id = ? ORDER BY name",
         (ctx.guild.id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return await ctx.send("! No templates are saved for this server.")
+    await ctx.send("Saved templates: " + ", ".join(f"`{row[0]}`" for row in rows))
+
+
+@bot.command()
+async def deletetemp(ctx, *, name: str):
+    try:
+        name = normalize_template_name(name)
+    except ValueError as error:
+        return await ctx.send(f"! {error}")
+    cursor = await bot.db.execute(
+        "DELETE FROM templates WHERE guild_id = ? AND name = ?",
+        (ctx.guild.id, name),
+    )
+    await bot.db.commit()
+    if cursor.rowcount == 0:
+        return await ctx.send(f"! Template `{name}` was not found.")
+    await ctx.send(f"> Deleted template `{name}`.")
+
+
+@bot.command()
+async def loadtemp(ctx, *, name: str):
+    try:
+        name = normalize_template_name(name)
+    except ValueError as error:
+        return await ctx.send(f"! {error}")
+    async with bot.db.execute(
+        "SELECT snapshot_json FROM templates WHERE guild_id = ? AND name = ?",
+        (ctx.guild.id, name),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
-        return await ctx.send("! No saved channel snapshot exists for this server.")
+        return await ctx.send(f"! Template `{name}` was not found for this server.")
 
     try:
         snapshot = json.loads(row[0])
@@ -1761,7 +2769,7 @@ async def loadtemp(ctx):
     except (discord.Forbidden, discord.HTTPException, ValueError) as error:
         return await ctx.send(f"! Restore stopped and may be incomplete: {error}")
 
-    await ctx.send(f"> Restored {len(categories)} categories and {len(channels)} channels from the saved snapshot.")
+    await ctx.send(f"> Restored template `{name}` with {len(categories)} categories and {len(channels)} channels.")
 
 @bot.command()
 async def roles(ctx):
@@ -1771,31 +2779,94 @@ async def roles(ctx):
     await ctx.send(embed=view.get_emb(), view=view)
 
 @bot.command(aliases=["r"])
-async def role(ctx, member: discord.Member, *, role_input: str):
-    if not ctx.author.guild_permissions.manage_roles: return
-    role_obj = None
-    if role_input.isdigit(): role_obj = ctx.guild.get_role(int(role_input))
-    if not role_obj:
-        matches = difflib.get_close_matches(role_input, [r.name for r in ctx.guild.roles], n=1, cutoff=0.3)
-        if matches: role_obj = discord.utils.get(ctx.guild.roles, name=matches[0])
-    if not role_obj: return await ctx.send("! Role not found.")
-    
-    author_top = ctx.author.top_role
-    if role_obj.position > author_top.position:
-        return await ctx.send("! You cannot modify a role higher than your highest role.")
-    if member == ctx.author and role_obj == author_top:
-        return await ctx.send("! You cannot change your own highest role.")
-    if ctx.guild.me.top_role.position <= role_obj.position:
+async def role(ctx, member: str, *, role_input: str):
+    remote_role_args = role_input.split()
+    remote_target = (
+        member.isdigit()
+        and len(remote_role_args) == 2
+        and all(value.isdigit() for value in remote_role_args)
+    )
+    target_guild = ctx.guild
+
+    if remote_target:
+        if ctx.author.id != BOT_OWNER_ID:
+            return await ctx.send("! Only the bot owner can change roles across servers.")
+        target_guild = bot.get_guild(int(member))
+        if target_guild is None:
+            return await ctx.send("! I am not in that server, or the server ID is invalid.")
+        if target_guild.me is None or not target_guild.me.guild_permissions.manage_roles:
+            return await ctx.send("! I need Manage Roles permission in the selected server.")
+        role_obj = target_guild.get_role(int(remote_role_args[0]))
+        target_member = await resolve_member_in_guild(target_guild, int(remote_role_args[1]))
+        if role_obj is None:
+            return await ctx.send("! Role not found.")
+        if target_member is None:
+            return await ctx.send("! User not found.")
+    else:
+        if ctx.guild is None:
+            return await ctx.send("! Use `-role <server_id> <role_id> <user_id>` in DMs.")
+        if not ctx.author.guild_permissions.manage_roles:
+            return
+        target_member = await resolve_member(ctx, member)
+        if not target_member:
+            return await ctx.send("! User not found.")
+        role_obj = None
+        if role_input.isdigit():
+            role_obj = ctx.guild.get_role(int(role_input))
+        if not role_obj:
+            matches = difflib.get_close_matches(role_input, [r.name for r in ctx.guild.roles], n=1, cutoff=0.3)
+            if matches:
+                role_obj = discord.utils.get(ctx.guild.roles, name=matches[0])
+        if not role_obj:
+            return await ctx.send("! Role not found.")
+
+    if bot.is_protected_user(target_member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
+    if not remote_target:
+        author_top = ctx.author.top_role
+        if role_obj.position > author_top.position:
+            return await ctx.send("! You cannot modify a role higher than your highest role.")
+        if target_member == ctx.author and role_obj == author_top:
+            return await ctx.send("! You cannot change your own highest role.")
+    if target_guild.me.top_role.position <= role_obj.position:
         return await ctx.send("! I cannot modify this role due to hierarchy.")
     
-    if role_obj in member.roles: 
-        await member.remove_roles(role_obj); await ctx.send(f"> Removed {role_obj.name}")
+    if role_obj in target_member.roles: 
+        await target_member.remove_roles(role_obj); await ctx.send(f"> Removed {role_obj.name}")
     else: 
-        await member.add_roles(role_obj); await ctx.send(f"> Added {role_obj.name}")
+        await target_member.add_roles(role_obj); await ctx.send(f"> Added {role_obj.name}")
+
+@bot.command()
+async def pic(ctx, member: discord.Member):
+    if not ctx.author.guild_permissions.manage_roles:
+        return await ctx.send("! You need the Manage Roles permission to use this command.")
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
+
+    role_obj = ctx.guild.get_role(1554568736118280223)
+    if role_obj is None:
+        return await ctx.send("! The configured role could not be found in this server.")
+    if role_obj >= ctx.author.top_role:
+        return await ctx.send("! You cannot modify a role equal to or higher than your highest role.")
+    if role_obj >= ctx.guild.me.top_role:
+        return await ctx.send("! I cannot modify this role due to role hierarchy.")
+
+    removing = role_obj in member.roles
+    action = "remove" if removing else "assign"
+    failure_message = "! The role could not be removed." if removing else "! The role could not be assigned."
+    try:
+        if removing:
+            await member.remove_roles(role_obj, reason=f"Removed with -pic by {ctx.author}")
+        else:
+            await member.add_roles(role_obj, reason=f"Assigned with -pic by {ctx.author}")
+    except (discord.Forbidden, discord.HTTPException) as error:
+        return await ctx.send(format_command_error(error, f"{action} the role", failure_message))
+    verb = "Removed" if removing else "Added"
+    await ctx.send(f"> {verb} {role_obj.name} {'from' if removing else 'to'} {member.mention}.")
 
 @bot.group(invoke_without_command=True)
 async def save(ctx):
-    await ctx.send("Use `,save upload` to save attachments from the last message in this channel.")
+    await ctx.send("Use `-save upload` to save attachments from the last message in this channel.")
 
 @save.command(name="upload")
 async def save_upload(ctx):
@@ -1815,20 +2886,20 @@ async def save_upload(ctx):
 
 @bot.group(invoke_without_command=True)
 async def an(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    enabled = await bot.is_antinuke_enabled(ctx.guild)
+    if not bot.is_an_admin(ctx.guild, ctx.author.id): return
+    enabled = bot.is_antinuke_enabled(ctx.guild)
     status = "Enabled ✅" if enabled else "Disabled ❌"
     embed = discord.Embed(title="Antinuke Command List", color=0x2b2d31)
-    embed.add_field(name=",an triggers", value="Show the current antinuke triggers.", inline=False)
-    embed.add_field(name=",an admin <member>", value="Toggle antinuke admin whitelist for the server.", inline=False)
-    embed.add_field(name=",an admins", value="List all whitelisted antinuke admins.", inline=False)
-    embed.add_field(name=",an on / ,an off", value="Enable or disable antinuke protection (owner only).", inline=False)
+    embed.add_field(name="-an triggers", value="Show the current antinuke triggers.", inline=False)
+    embed.add_field(name="-an on [guild_id] / -an off [guild_id]", value="Bot owner only. Enable or disable antinuke protection for this or another server the bot is in.", inline=False)
+    embed.add_field(name="-an admin <member> [guild_id]", value="Toggle a member in this or another server's antinuke admin list (bot owner only).", inline=False)
+    embed.add_field(name="-an admins [guild_id]", value="List antinuke admins for this or another server.", inline=False)
     embed.set_footer(text=f"Antinuke status: {status}")
     await ctx.send(embed=embed)
 
 @an.command(name="triggers")
 async def an_triggers(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
+    if not bot.is_an_admin(ctx.guild, ctx.author.id): return
     embed = discord.Embed(title="Antinuke Triggers", color=0x2b2d31)
     embed.description = (
         "• Unauthorized channel creation\n"
@@ -1843,65 +2914,101 @@ async def an_triggers(ctx):
     await ctx.send(embed=embed)
 
 @an.command(name="on")
-async def an_on(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    await bot.set_antinuke_enabled(ctx.guild, True)
-    await ctx.send("Antinuke protection is now enabled.")
+async def an_on(ctx, guild_id: int = None):
+    await update_antinuke_status(ctx, True, guild_id)
 
 @an.command(name="off")
-async def an_off(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    await bot.set_antinuke_enabled(ctx.guild, False)
-    await ctx.send("Antinuke protection is now disabled.")
+async def an_off(ctx, guild_id: int = None):
+    await update_antinuke_status(ctx, False, guild_id)
+
+
+async def update_antinuke_status(ctx, enabled, guild_id=None):
+    if ctx.author.id != BOT_OWNER_ID:
+        return await ctx.send("You can't use this command. Only the bot owner can run `-an on` and `-an off`.")
+    guild = await resolve_target_guild(ctx, guild_id)
+    if guild is None:
+        return
+
+    await bot.set_antinuke_enabled(guild, enabled)
+    status = "enabled" if enabled else "disabled"
+    await ctx.send(f"Antinuke protection is now {status} in **{guild.name}** (`{guild.id}`).")
 
 @an.command(name="admin")
-async def an_admin(ctx, member: discord.Member):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    async with bot.db.execute("SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id)) as cursor:
-        if await cursor.fetchone():
-            await bot.db.execute("DELETE FROM admins WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
-            action = "removed from"
-        else:
-            await bot.db.execute("INSERT INTO admins VALUES (?, ?)", (ctx.guild.id, member.id))
-            action = "added to"
+async def an_admin(ctx, member: str, guild_id: int = None):
+    if ctx.author.id != BOT_OWNER_ID:
+        return await ctx.send("! Only the bot owner can add or remove antinuke admins.")
+    guild = await resolve_target_guild(ctx, guild_id)
+    if guild is None:
+        return
+    member_id = member.strip("<@!>")
+    if not member_id.isdigit():
+        return await ctx.send("! Provide a member mention or user ID.")
+    member_id = int(member_id)
+    target_member = guild.get_member(member_id)
+    if target_member is None:
+        try:
+            target_member = await guild.fetch_member(member_id)
+        except discord.NotFound:
+            return await ctx.send("! That user is not a member of the selected server.")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not resolve member %s in guild %s", member_id, guild.id)
+            return await ctx.send("! I couldn't look up that member in the selected server.")
+    admins = bot._antinuke_admins_cache.setdefault(guild.id, set())
+    existing_admin = member_id in admins
+    if existing_admin:
+        await bot.db.execute("DELETE FROM admins WHERE guild_id = ? AND user_id = ?", (guild.id, member_id))
+        action = "removed from"
+    else:
+        await bot.db.execute("INSERT INTO admins VALUES (?, ?)", (guild.id, member_id))
+        action = "added to"
     await bot.db.commit()
-    await ctx.send(f"{member.mention} has been {action} the antinuke whitelist.")
+    if existing_admin:
+        admins.discard(member_id)
+    else:
+        admins.add(member_id)
+    await ctx.send(f"{target_member.mention} has been {action} the antinuke whitelist in **{guild.name}**.")
 
 @an.command(name="admins")
-async def an_admins(ctx):
-    if not await bot.is_an_admin(ctx.guild, ctx.author.id): return
-    async with bot.db.execute("SELECT user_id FROM admins WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-        rows = await cursor.fetchall()
+async def an_admins(ctx, guild_id: int = None):
+    if guild_id is not None or ctx.guild is None:
+        if ctx.author.id != BOT_OWNER_ID:
+            return await ctx.send("! Only the bot owner can view antinuke admins globally.")
+    elif not bot.is_an_admin(ctx.guild, ctx.author.id):
+        return
+    guild = await resolve_target_guild(ctx, guild_id)
+    if guild is None:
+        return
+    rows = [(user_id,) for user_id in sorted(bot._antinuke_admins_cache.get(guild.id, set()))]
     if not rows:
-        return await ctx.send("No antinuke admins are currently whitelisted.")
+        return await ctx.send(f"No antinuke admins are currently whitelisted in **{guild.name}**.")
     lines = []
     for (user_id,) in rows:
-        user = ctx.guild.get_member(user_id)
+        user = guild.get_member(user_id)
         if user:
             lines.append(f"<@{user_id}> — {user.name}#{user.discriminator}")
         else:
             lines.append(f"<@{user_id}> — {user_id}")
-    embed = discord.Embed(title="Antinuke Admins", description="\n".join(lines), color=0x2b2d31)
+    embed = discord.Embed(title=f"Antinuke Admins — {guild.name}", description="\n".join(lines), color=0x2b2d31)
     await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=[]))
 
 @bot.command()
 async def nuke(ctx):
-    # Cooldown check
-    user_id = ctx.author.id
-    now = time.time()
-    if user_id in nuke_cooldowns:
-        if now - nuke_cooldowns[user_id] < 60:
-            remaining = 60 - (now - nuke_cooldowns[user_id])
-            return await ctx.send(f" This command can be used again in {round(remaining)} seconds.")
-    
-    nuke_cooldowns[user_id] = now
-    await ctx.send(embed=discord.Embed(description="Confirm Nuke?"), view=NukeConfirm(ctx))
+    await ctx.send(
+        embed=discord.Embed(
+            title="Replace this channel?",
+            description=(
+                "Confirming will create a copy of this channel and delete the current channel. "
+                "Messages from the current channel will not be copied."
+            ),
+        ),
+        view=NukeConfirm(ctx),
+    )
 
 @bot.group(invoke_without_command=True)
 async def wl(ctx, *, target: str = None):
     if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
     if not target:
-        return await ctx.send("Use ,wl <member or user ID> to toggle access, or ,wl list to view the whitelist.")
+        return await ctx.send("Use -wl <member or user ID> to toggle access, or -wl list to view the whitelist.")
 
     member = await resolve_member(ctx, target)
     if not member:
@@ -1914,7 +3021,7 @@ async def wl(ctx, *, target: str = None):
     if not member:
         return await ctx.send("! Server member not found.")
 
-    if await bot.is_whitelisted(ctx.guild, member.id):
+    if bot.is_whitelisted(ctx.guild, member.id):
         await bot.remove_whitelisted_user(ctx.guild, member.id)
         await ctx.send(f"> {member.mention} has been removed from the whitelist.")
     else:
@@ -1927,7 +3034,7 @@ async def wl_add(ctx, *, target: str):
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
-    if await bot.is_whitelisted(ctx.guild, member.id):
+    if bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is already whitelisted.")
     await bot.add_whitelisted_user(ctx.guild, member.id)
     await ctx.send(f"> {member.mention} has been whitelisted.")
@@ -1938,7 +3045,7 @@ async def wl_remove(ctx, *, target: str):
     member = await resolve_member(ctx, target)
     if not member:
         return await ctx.send("! User not found.")
-    if not await bot.is_whitelisted(ctx.guild, member.id):
+    if not bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is not whitelisted.")
     await bot.remove_whitelisted_user(ctx.guild, member.id)
     await ctx.send(f"> {member.mention} has been removed from whitelist.")
@@ -1946,8 +3053,7 @@ async def wl_remove(ctx, *, target: str):
 @wl.command(name="list")
 async def wl_list(ctx):
     if not bot.can_manage_whitelist(ctx.guild, ctx.author.id): return
-    async with bot.db.execute("SELECT user_id FROM whitelist_users WHERE guild_id = ?", (ctx.guild.id,)) as cursor:
-        rows = await cursor.fetchall()
+    rows = [(user_id,) for user_id in sorted(bot._whitelist_cache.get(ctx.guild.id, set()))]
     if not rows:
         return await ctx.send("No whitelisted users in this server.")
     lines = []
@@ -1967,14 +3073,61 @@ async def wl_list(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f" This command can be used again in {round(error.retry_after)} seconds.")
-    elif isinstance(error, commands.CheckFailure):
+        await ctx.send(
+            f"This command is on cooldown. Try again in {max(1, round(error.retry_after))} seconds."
+        )
+    elif isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
         return
+    elif isinstance(error, commands.MissingRequiredArgument):
+        command = ctx.command
+        if command is not None:
+            usage = f" Usage: `-{command.qualified_name} {command.signature}`."
+        else:
+            usage = " Run `-help` to see command formats."
+        await ctx.send(
+            f"This command is missing the required `{error.param.name}` argument.{usage}"
+        )
+    elif isinstance(error, commands.BadArgument):
+        command = ctx.command
+        if command is not None:
+            usage = f" Correct format: `-{command.qualified_name} {command.signature}`."
+        else:
+            usage = " Check `-help` for the correct command format."
+        await ctx.send(f"One or more arguments don't match the expected format.{usage}")
     else:
-        raise error
+        cause = error.original if isinstance(error, commands.CommandInvokeError) else error
+        logger.error(
+            "Command %s failed for user %s in guild %s",
+            ctx.command.qualified_name if ctx.command else "(unknown)",
+            ctx.author.id,
+            ctx.guild.id if ctx.guild else "(DM)",
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+        await ctx.send(
+            "I couldn't complete that command because of an unexpected error. "
+            "The details were recorded in the bot log."
+        )
 
 @bot.command()
-async def execute(ctx, user: discord.User):
+async def execute(ctx, user: str = None):
+    if user and user.casefold() == "list":
+        async with bot.db.execute(
+            "SELECT user_id FROM executed_users WHERE guild_id = ? ORDER BY user_id",
+            (ctx.guild.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            return await ctx.send("No executed users are recorded for this server.")
+        lines = [f"<@{user_id}> ({user_id})" for (user_id,) in rows]
+        embed = discord.Embed(title="Executed Users", description=log_text("\n".join(lines), 4000))
+        return await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    if not user:
+        return await ctx.send("Use `-execute <user>` or `-execute list`.")
+    user = await resolve_user(ctx, user)
+    if user is None:
+        return await ctx.send("! User not found.")
+    if bot.is_protected_user(user.id):
+        return await ctx.send("! This user is protected from bot moderation.")
     try:
         await ctx.guild.ban(user, reason="executed")
         await bot.add_executed_user(ctx.guild, user.id)
@@ -1991,61 +3144,140 @@ async def pardon(ctx, user: discord.User):
     except Exception as e:
         await ctx.send(f"! Could not pardon user.")
 
+
+@bot.command(name="snap2")
+async def snap2(ctx, user: discord.User):
+    if bot.is_protected_user(user.id) or user.id == ctx.guild.owner_id:
+        return await ctx.send("! This user is protected from this ban command.")
+    try:
+        await ctx.guild.ban(user, reason=f"Permanent ban requested by {ctx.author} with -snap2")
+        await ctx.send(f"> Banned {user} ({user.id}). Use `-unsnap2 {user.id}` to reverse this ban.")
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await ctx.send(format_command_error(error, "ban this user", "! User could not be banned."))
+
+
+@bot.command(name="unsnap2")
+async def unsnap2(ctx, user: discord.User):
+    try:
+        await ctx.guild.unban(user, reason=f"Ban reversed by {ctx.author} with -unsnap2")
+        await ctx.send(f"> Reversed the ban for {user} ({user.id}).")
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await ctx.send(format_command_error(error, "reverse this ban", "! User is not banned or could not be unbanned."))
+
+
+@bot.command(name="setverify")
+async def setverify(ctx, access_role_id: int, verified_role_id: int, *, message: str):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if ctx.author.id != BOT_OWNER_ID and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.send("! Only the server owner or bot owner can configure verification.")
+    access_role = ctx.guild.get_role(access_role_id)
+    verified_role = ctx.guild.get_role(verified_role_id)
+    bot_member = ctx.guild.me
+    if access_role is None or verified_role is None:
+        return await ctx.send("! Both role IDs must belong to this server.")
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        return await ctx.send("! I need Manage Roles permission to assign the verification role.")
+    if verified_role >= bot_member.top_role:
+        return await ctx.send("! The verification role must be below my highest role.")
+
+    verification_message = await ctx.send(
+        message,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    await verification_message.add_reaction("✅")
+    await bot.db.execute(
+        "INSERT INTO verification_settings (guild_id, channel_id, message_id, access_role_id, verified_role_id) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET "
+        "channel_id = excluded.channel_id, message_id = excluded.message_id, "
+        "access_role_id = excluded.access_role_id, verified_role_id = excluded.verified_role_id",
+        (ctx.guild.id, ctx.channel.id, verification_message.id, access_role.id, verified_role.id),
+    )
+    await bot.db.commit()
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.guild_id is None or payload.user_id == bot.user.id or str(payload.emoji) != "✅":
+        return
+    async with bot.db.execute(
+        "SELECT channel_id, message_id, access_role_id, verified_role_id "
+        "FROM verification_settings WHERE guild_id = ?",
+        (payload.guild_id,),
+    ) as cursor:
+        settings = await cursor.fetchone()
+    if settings is None or payload.channel_id != settings[0] or payload.message_id != settings[1]:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
+            return
+    access_role = guild.get_role(settings[2])
+    verified_role = guild.get_role(settings[3])
+    bot_member = guild.me
+    if access_role is None or verified_role is None or access_role not in member.roles:
+        return
+    if bot_member is None or verified_role >= bot_member.top_role:
+        return
+    try:
+        await member.add_roles(verified_role, reason="Verification reaction from an authorized member")
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Could not assign verification role to member %s in guild %s", member.id, guild.id)
+
 @bot.event
 async def on_member_join(member):
     guild = member.guild
     embed = discord.Embed(title="Member Joined", color=0x00ff00)
     embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
-    await bot.send_log(guild, embed)
-
-    if not member.bot:
-        join_channel_id = await bot.get_join_channel(guild)
-        if join_channel_id:
-            channel = guild.get_channel(join_channel_id)
-            if channel:
-                embed = discord.Embed(
-                    title=f"{member}",
-                    description=f"{member.mention} has joined the server.",
-                    color=0xffffff
-                )
-                embed.set_thumbnail(url=member.display_avatar.url)
-                embed.add_field(name="User", value=f"{member} ({member.id})", inline=False)
-                embed.set_image(url="https://cdn.pfps.gg/banners/66131-deg.gif")
-                embed.set_footer(text="")
-                await channel.send(embed=embed)
-
     if member.bot:
-        if await bot.is_executed(guild, member.id):
-            try:
-                await member.ban(reason="executed")
-            except: pass
-        if not await bot.is_antinuke_enabled(guild): return
-        t_start = time.time()
-        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.bot_add):
-            if entry is None or entry.user is None: return
-            if await bot.is_an_admin(guild, entry.user.id): return
-            embed = discord.Embed(title="Unauthorized Bot Added", color=0xff0000)
-            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
-            embed.add_field(name="Bot", value=f"{member} ({member.id})", inline=False)
-            embed.add_field(name="Added by", value=f"{entry.user} ({entry.user.id})", inline=False)
-            await bot.send_log(guild, embed)
-            try:
-                await bot.strip_roles(entry.user)
-                await member.kick(reason="Antinuke: Unauthorized bot added")
-                speed = round(time.time() - t_start, 2)
-                asyncio.create_task(bot.punish_actor(guild, entry.user, f"Unauthorized Bot Add ({member.name})", speed=speed, ban_actor=True, punishment="Banned & Roles Stripped"))
-            except: pass
-            break
+        entry = await bot.find_audit_entry(guild, discord.AuditLogAction.bot_add, member.id)
+        details = f"Bot added to the server: {member} ({member.id})."
+        if not await bot.report_antinuke_event(guild, entry, "Bot added", details):
+            bot.create_background_task(
+                bot.send_log(
+                    guild,
+                    discord.Embed(title="Bot Added", description=details, color=0xff0000),
+                ),
+                f"bot-add log for guild {guild.id}",
+            )
+        bot.create_background_task(bot.send_log(guild, embed), f"member-join log for guild {guild.id}")
+        return
+
+    bot.create_background_task(bot.send_log(guild, embed), f"member-join log for guild {guild.id}")
+    join_channel_id = bot.get_join_channel(guild)
+    if join_channel_id:
+        channel = guild.get_channel(join_channel_id)
+        if channel:
+            embed = discord.Embed(
+                title=f"{member}",
+                description=f"{member.mention} has joined the server.",
+                color=0xffffff
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(name="User", value=f"{member} ({member.id})", inline=False)
+            embed.set_image(url="https://cdn.pfps.gg/banners/66131-deg.gif")
+            embed.set_footer(text="")
+            await channel.send(embed=embed)
 
 @bot.event
 async def on_member_unban(guild, user):
-    embed = discord.Embed(title="Member Unbanned", color=0x00ff00)
-    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    await bot.send_log(guild, embed)
-    if await bot.is_executed(guild, user.id):
-        try:
-            await guild.ban(user, reason="executed")
-        except: pass
+    entry = await bot.find_audit_entry(guild, discord.AuditLogAction.unban, user.id)
+    details = f"Member unbanned: {user} ({user.id})."
+    if bot.is_executed(guild, user.id):
+        details += " This user is recorded in the executed-users list."
+    if not await bot.report_antinuke_event(guild, entry, "Member unban", details):
+        embed = discord.Embed(title="Member Unbanned", description=details, color=0x00ff00)
+        if entry and entry.user:
+            embed.set_author(name=f"{entry.user} ({entry.user.id})", icon_url=entry.user.display_avatar.url)
+        if entry and entry.reason:
+            embed.add_field(name="Reason", value=log_text(entry.reason), inline=False)
+        bot.create_background_task(bot.send_log(guild, embed), f"member-unban log for guild {guild.id}")
 
 @bot.command()
 async def c(ctx, amount: int):
@@ -2053,4 +3285,127 @@ async def c(ctx, amount: int):
     await ctx.message.delete()
     await ctx.channel.purge(limit=amount, check=lambda m: not m.pinned)
 
-bot.run("MTU1Nzc3MTc1ODM0NDM0NzgxOQ.GHbR5O.XsFlZhgHTmochEhtikbZQl3F4WpG9MNTZOgNJM")
+@bot.command()
+async def lock(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if not bot.is_whitelisted(ctx.guild, ctx.author.id):
+        return await ctx.send("! You need to be whitelisted to use this command.")
+    bot_member = ctx.guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_channels:
+        return await ctx.send("! I need the Manage Channels permission to lock this channel.")
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.send("! This command can only be used in a text channel.")
+
+    allowed_role = ctx.guild.get_role(1554831502779621406)
+    if allowed_role is None:
+        return await ctx.send("! The configured role for this lock was not found in this server.")
+    overwrites = ctx.channel.overwrites
+    for target, overwrite in overwrites.items():
+        if target == ctx.guild.default_role:
+            overwrite.send_messages = False
+        elif target == allowed_role:
+            overwrite.send_messages = True
+        elif isinstance(target, discord.Member) and target == bot_member:
+            overwrite.send_messages = True
+        elif isinstance(target, discord.Member) and allowed_role in target.roles:
+            overwrite.send_messages = True
+        elif overwrite.send_messages is True:
+            overwrite.send_messages = False
+    default_overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    default_overwrite.send_messages = False
+    overwrites[ctx.guild.default_role] = default_overwrite
+    role_overwrite = ctx.channel.overwrites_for(allowed_role)
+    role_overwrite.send_messages = True
+    overwrites[allowed_role] = role_overwrite
+    bot_overwrite = ctx.channel.overwrites_for(bot_member)
+    bot_overwrite.send_messages = True
+    overwrites[bot_member] = bot_overwrite
+    try:
+        await ctx.channel.edit(
+            overwrites=overwrites,
+            reason=f"Channel locked by {ctx.author}",
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        return await ctx.send(format_command_error(error, "lock this channel", "! The channel could not be locked."))
+    await ctx.send("> This channel is now locked. Only members with the configured role can type.")
+
+@bot.command()
+async def unlock(ctx):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if not bot.is_whitelisted(ctx.guild, ctx.author.id):
+        return await ctx.send("! You need to be whitelisted to use this command.")
+    bot_member = ctx.guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_channels:
+        return await ctx.send("! I need the Manage Channels permission to unlock this channel.")
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.send("! This command can only be used in a text channel.")
+
+    overwrites = ctx.channel.overwrites
+    for target, overwrite in list(overwrites.items()):
+        overwrite.send_messages = None
+        if overwrite.is_empty():
+            del overwrites[target]
+    try:
+        await ctx.channel.edit(
+            overwrites=overwrites,
+            reason=f"Channel unlocked by {ctx.author}",
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        return await ctx.send(format_command_error(error, "unlock this channel", "! The channel could not be unlocked."))
+    await ctx.send("> This channel is now unlocked.")
+
+def main():
+    token = ""
+    for variable in ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN", "BOT_TOKEN", "TOKEN"):
+        token = os.getenv(variable, "").strip()
+        if token:
+            logger.info("Found bot token in environment variable %s.", variable)
+            break
+    if not token:
+        if not sys.stdin.isatty():
+            logger.critical(
+                "No bot token is configured in DISCORD_BOT_TOKEN or the hosting "
+                "environment, and no interactive console is available. Add your "
+                "token to the DISCORD_BOT_TOKEN environment variable."
+            )
+            raise SystemExit(1)
+        try:
+            token = getpass.getpass("Enter your Discord bot token (input hidden): ").strip()
+        except (EOFError, OSError):
+            logger.critical(
+                "Could not read a token from this window. Set DISCORD_BOT_TOKEN "
+                "in the environment or launch the bot from a terminal."
+            )
+            raise SystemExit(1) from None
+    if not token:
+        logger.critical("No token was entered. The bot was not started.")
+        raise SystemExit(1)
+    try:
+        logger.info("Starting Discord client.")
+        bot.run(token)
+    except discord.LoginFailure:
+        logger.critical(
+            "Discord rejected the bot token. Copy the bot token from the Discord "
+            "Developer Portal and try again; do not share it with anyone."
+        )
+        raise SystemExit(1) from None
+    except discord.PrivilegedIntentsRequired:
+        logger.critical(
+            "Discord requires privileged intents for this bot. In the Discord "
+            "Developer Portal, open your application > Bot > Privileged Gateway "
+            "Intents and enable Server Members Intent and Message Content Intent. "
+            "The Guild Moderation intent is enabled in the bot code for live audit-log events."
+        )
+        raise SystemExit(1) from None
+    except Exception:
+        logger.exception(
+            "Bot startup or connection failed. Check the error above, your "
+            "internet connection, and the bot's Discord Developer Portal settings."
+        )
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()
