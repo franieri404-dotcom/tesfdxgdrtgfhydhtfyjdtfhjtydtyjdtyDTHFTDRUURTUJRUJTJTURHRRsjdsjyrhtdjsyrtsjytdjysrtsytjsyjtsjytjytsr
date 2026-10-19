@@ -38,6 +38,7 @@ last_deleted_messages: dict[int, discord.Message | None] = {}
 # --- Bot Configuration ---
 BLACKLIST_ROLE_ID =1497982597387780339   # Set your Blacklist role ID here if you want to use a fixed role
 BLACKLIST_PRESERVED_ROLE_ID = 1417634409074659398
+JOIN_TO_CREATE_BOT_ID = 593921296224747521
 STATUS_MESSAGES = [
     "affective runs eu",
 
@@ -1831,7 +1832,13 @@ async def on_guild_channel_create(channel):
         await channel.delete(reason="Antinuke: reverting unauthorized channel creation")
         return "Unauthorized channel deleted."
 
-    if await bot.enforce_antinuke_action(
+    is_join_to_create_channel = (
+        isinstance(channel, discord.VoiceChannel)
+        and entry is not None
+        and entry.user is not None
+        and entry.user.id == JOIN_TO_CREATE_BOT_ID
+    )
+    if not is_join_to_create_channel and await bot.enforce_antinuke_action(
         guild, entry, "Unauthorized channel creation", details, delete_channel
     ):
         return
