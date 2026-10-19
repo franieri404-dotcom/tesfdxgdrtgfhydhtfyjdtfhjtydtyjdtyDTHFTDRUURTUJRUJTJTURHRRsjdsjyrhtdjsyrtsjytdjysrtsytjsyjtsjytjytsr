@@ -412,6 +412,33 @@ class AntiNukeBot(commands.Bot):
         if admin_roles:
             await member.remove_roles(*admin_roles, reason=reason)
 
+    async def strip_blacklisted_roles(self, member):
+        if self.is_protected_user(member.id):
+            return "This user is protected from bot moderation."
+
+        bot_member = member.guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_roles:
+            return "I need Manage Roles permission to remove this member's roles."
+
+        roles = [role for role in member.roles if not role.is_default()]
+        removable_roles = [
+            role for role in roles
+            if not role.managed and role < bot_member.top_role
+        ]
+        if removable_roles:
+            await member.remove_roles(
+                *removable_roles,
+                reason="Antinuke: removing roles from blacklisted member",
+            )
+
+        skipped_count = len(roles) - len(removable_roles)
+        if skipped_count:
+            return (
+                f"Removed {len(removable_roles)} role(s), but could not remove "
+                f"{skipped_count} managed or higher role(s). Check role hierarchy."
+            )
+        return f"Removed {len(removable_roles)} role(s)."
+
     def _prune_audit_log_entries(self, now):
         self._audit_log_entries = [
             (received_at, entry)
@@ -1369,9 +1396,9 @@ async def bl(ctx, *, target: str):
         return await ctx.send("! This user is protected from bot moderation.")
     if bot.is_whitelisted(ctx.guild, member.id):
         return await ctx.send(f"> {member.mention} is whitelisted and cannot be blacklisted.")
-    blacklist_role = await bot.get_blacklist_role(ctx.guild)
     if bot.is_blacklisted(ctx.guild, member.id):
         await bot.remove_blacklisted_user(ctx.guild, member.id)
+        blacklist_role = await bot.get_blacklist_role(ctx.guild)
         try:
             if blacklist_role and blacklist_role in member.roles:
                 await member.remove_roles(blacklist_role, reason="Antinuke: Blacklist removed by admin")
@@ -1380,11 +1407,11 @@ async def bl(ctx, *, target: str):
 
     await bot.add_blacklisted_user(ctx.guild, member.id)
     try:
-        await bot.remove_admin_roles(member)
-        if blacklist_role and blacklist_role not in member.roles:
-            await member.add_roles(blacklist_role, reason="Antinuke: Blacklisted user")
-    except: pass
-    await ctx.send(f"> {member.mention} has been blacklisted.")
+        role_result = await bot.strip_blacklisted_roles(member)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Could not strip roles from blacklisted member %s in guild %s", member.id, ctx.guild.id)
+        role_result = "Role removal failed; check my Manage Roles permission and role hierarchy."
+    await ctx.send(f"> {member.mention} has been blacklisted. {role_result}")
 
 @bot.command(aliases=["unbl","unblacklist"])
 async def unshut_blacklist(ctx, *, target: str):
@@ -2160,13 +2187,15 @@ async def on_member_update(before, after):
             await bot.send_log(after.guild, embed)
     if roles_changed:
         if not bot.is_protected_user(after.id) and bot.is_blacklisted(after.guild, after.id):
-            blacklist_role = await bot.get_blacklist_role(after.guild)
-            if blacklist_role and blacklist_role not in after.roles:
-                try: await after.add_roles(blacklist_role, reason="Antinuke: Re-adding blacklist role")
-                except: pass
             try:
-                await bot.remove_admin_roles(after)
-            except: pass
+                await bot.strip_blacklisted_roles(after)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Could not remove roles from blacklisted member %s in guild %s",
+                    after.id,
+                    after.guild.id,
+                )
+            return
 
         dangerous_added = [r for r in after.roles if r not in before.roles and bot.has_dangerous_permissions(r.permissions)]
         if not bot.is_protected_user(after.id) and dangerous_added:
