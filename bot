@@ -1015,6 +1015,10 @@ class ColorRoleView(discord.ui.View):
             await member.remove_roles(role, reason="Color role removed")
             await interaction.response.send_message(f"Removed the {role.name} role from your account.", ephemeral=True)
         else:
+            if bot.is_blacklisted(interaction.guild, member.id):
+                return await interaction.response.send_message(
+                    "Blacklisted members cannot receive roles.", ephemeral=True
+                )
             await member.add_roles(role, reason="Color role added")
             await interaction.response.send_message(f"Added the {role.name} role to your account.", ephemeral=True)
 
@@ -1087,6 +1091,10 @@ class PingRoleView(discord.ui.View):
             await member.remove_roles(role, reason="Ping role removed")
             await interaction.response.send_message(f"Removed the {role.name} notification role from your account.", ephemeral=True)
         else:
+            if bot.is_blacklisted(interaction.guild, member.id):
+                return await interaction.response.send_message(
+                    "Blacklisted members cannot receive roles.", ephemeral=True
+                )
             await member.add_roles(role, reason="Ping role added")
             await interaction.response.send_message(f"Added the {role.name} notification role to your account.", ephemeral=True)
 
@@ -2166,6 +2174,27 @@ async def on_member_ban(guild, user):
 @bot.event
 async def on_member_update(before, after):
     roles_changed = before.roles != after.roles
+    if (
+        roles_changed
+        and not bot.is_protected_user(after.id)
+        and bot.is_blacklisted(after.guild, after.id)
+    ):
+        try:
+            result = await bot.strip_blacklisted_roles(after)
+            logger.info(
+                "Removed assigned roles from blacklisted member %s in guild %s: %s",
+                after.id,
+                after.guild.id,
+                result,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not remove roles from blacklisted member %s in guild %s",
+                after.id,
+                after.guild.id,
+            )
+        return
+
     timeout_changed = before.timed_out_until != after.timed_out_until
     entry = None
     if roles_changed or timeout_changed:
@@ -2186,17 +2215,6 @@ async def on_member_update(before, after):
                 embed.add_field(name="Reason", value=log_text(entry.reason), inline=False)
             await bot.send_log(after.guild, embed)
     if roles_changed:
-        if not bot.is_protected_user(after.id) and bot.is_blacklisted(after.guild, after.id):
-            try:
-                await bot.strip_blacklisted_roles(after)
-            except (discord.Forbidden, discord.HTTPException):
-                logger.exception(
-                    "Could not remove roles from blacklisted member %s in guild %s",
-                    after.id,
-                    after.guild.id,
-                )
-            return
-
         dangerous_added = [r for r in after.roles if r not in before.roles and bot.has_dangerous_permissions(r.permissions)]
         if not bot.is_protected_user(after.id) and dangerous_added:
             role_names = ", ".join(f"{role.name} ({role.id})" for role in dangerous_added)
@@ -2863,6 +2881,8 @@ async def role(ctx, member: str, *, role_input: str):
     if role_obj in target_member.roles: 
         await target_member.remove_roles(role_obj); await ctx.send(f"> Removed {role_obj.name}")
     else: 
+        if bot.is_blacklisted(target_guild, target_member.id):
+            return await ctx.send("! Blacklisted members cannot receive roles.")
         await target_member.add_roles(role_obj); await ctx.send(f"> Added {role_obj.name}")
 
 @bot.command()
@@ -2881,6 +2901,8 @@ async def pic(ctx, member: discord.Member):
         return await ctx.send("! I cannot modify this role due to role hierarchy.")
 
     removing = role_obj in member.roles
+    if not removing and bot.is_blacklisted(ctx.guild, member.id):
+        return await ctx.send("! Blacklisted members cannot receive roles.")
     action = "remove" if removing else "assign"
     failure_message = "! The role could not be removed." if removing else "! The role could not be assigned."
     try:
@@ -3252,6 +3274,8 @@ async def on_raw_reaction_add(payload):
     bot_member = guild.me
     if access_role is None or verified_role is None or access_role not in member.roles:
         return
+    if bot.is_blacklisted(guild, member.id):
+        return
     if bot_member is None or verified_role >= bot_member.top_role:
         return
     try:
@@ -3262,6 +3286,15 @@ async def on_raw_reaction_add(payload):
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    if bot.is_blacklisted(guild, member.id) and not bot.is_protected_user(member.id):
+        try:
+            await bot.strip_blacklisted_roles(member)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not remove roles from returning blacklisted member %s in guild %s",
+                member.id,
+                guild.id,
+            )
     embed = discord.Embed(title="Member Joined", color=0x00ff00)
     embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
     if member.bot:
