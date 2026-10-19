@@ -117,6 +117,7 @@ class AntiNukeBot(commands.Bot):
         self._log_channels_cache: dict[int, set[int]] = {}
         self._shut_users_cache: dict[int, set[int]] = {}
         self._blacklist_users_cache: dict[int, set[int]] = {}
+        self._vanished_users_cache: dict[int, set[int]] = {}
         self._executed_users_cache: dict[int, set[int]] = {}
         self._clean_channels_cache: dict[int, set[int]] = {}
         self._join_channels_cache: dict[int, int] = {}
@@ -135,6 +136,7 @@ class AntiNukeBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS logs (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS shut_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS blacklist_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS vanished_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS whitelist_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS executed_users (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS join_channels (guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
@@ -173,6 +175,7 @@ class AntiNukeBot(commands.Bot):
                 self._log_channels_cache.setdefault(guild_id, set()).add(channel_id)
         self._shut_users_cache = await self._load_user_cache("shut_users")
         self._blacklist_users_cache = await self._load_user_cache("blacklist_users")
+        self._vanished_users_cache = await self._load_user_cache("vanished_users")
         self._executed_users_cache = await self._load_user_cache("executed_users")
         async with self.db.execute("SELECT guild_id, channel_id FROM clean_channels") as cursor:
             self._clean_channels_cache = {}
@@ -286,6 +289,25 @@ class AntiNukeBot(commands.Bot):
 
     def is_blacklisted(self, guild, user_id):
         return user_id in self._blacklist_users_cache.get(guild.id, set())
+
+    def is_vanished(self, guild, user_id):
+        return user_id in self._vanished_users_cache.get(guild.id, set())
+
+    async def add_vanished_user(self, guild, user_id):
+        await self.db.execute(
+            "INSERT OR IGNORE INTO vanished_users (guild_id, user_id) VALUES (?, ?)",
+            (guild.id, user_id),
+        )
+        await self.db.commit()
+        self._vanished_users_cache.setdefault(guild.id, set()).add(user_id)
+
+    async def remove_vanished_user(self, guild, user_id):
+        await self.db.execute(
+            "DELETE FROM vanished_users WHERE guild_id = ? AND user_id = ?",
+            (guild.id, user_id),
+        )
+        await self.db.commit()
+        self._vanished_users_cache.setdefault(guild.id, set()).discard(user_id)
 
     async def add_blacklisted_user(self, guild, user_id):
         await self.db.execute("INSERT OR IGNORE INTO blacklist_users (guild_id, user_id) VALUES (?, ?)", (guild.id, user_id))
@@ -1026,6 +1048,11 @@ class ColorRoleView(discord.ui.View):
             await member.remove_roles(role, reason="Color role removed")
             await interaction.response.send_message(f"Removed the {role.name} role from your account.", ephemeral=True)
         else:
+            if bot.is_vanished(interaction.guild, member.id):
+                return await interaction.response.send_message(
+                    "Vanished members cannot receive roles. Ask a whitelisted user to unvanish you.",
+                    ephemeral=True,
+                )
             if bot.is_blacklisted(interaction.guild, member.id):
                 return await interaction.response.send_message(
                     "Blacklisted members cannot receive roles.", ephemeral=True
@@ -1102,6 +1129,11 @@ class PingRoleView(discord.ui.View):
             await member.remove_roles(role, reason="Ping role removed")
             await interaction.response.send_message(f"Removed the {role.name} notification role from your account.", ephemeral=True)
         else:
+            if bot.is_vanished(interaction.guild, member.id):
+                return await interaction.response.send_message(
+                    "Vanished members cannot receive roles. Ask a whitelisted user to unvanish you.",
+                    ephemeral=True,
+                )
             if bot.is_blacklisted(interaction.guild, member.id):
                 return await interaction.response.send_message(
                     "Blacklisted members cannot receive roles.", ephemeral=True
@@ -1445,6 +1477,7 @@ async def vanish(ctx, *, target: str):
     if bot.is_protected_user(member.id):
         return await ctx.send("! This user is protected from bot moderation.")
 
+    await bot.add_vanished_user(ctx.guild, member.id)
     try:
         role_result = await bot.remove_member_roles(
             member,
@@ -1456,9 +1489,28 @@ async def vanish(ctx, *, target: str):
             member.id,
             ctx.guild.id,
         )
-        return await ctx.send("! Role removal failed; check my Manage Roles permission and role hierarchy.")
+        return await ctx.send(
+            "! The member is marked as vanished, but role removal failed. "
+            "Check my Manage Roles permission and role hierarchy."
+        )
 
-    await ctx.send(f"> Removed roles from {member.mention}. {role_result}")
+    await ctx.send(f"> {member.mention} is now vanished. {role_result}")
+
+@bot.command()
+async def unvanish(ctx, *, target: str):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if not bot.is_whitelisted(ctx.guild, ctx.author.id):
+        return await ctx.send("! Only whitelisted users can use this command.")
+
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if not bot.is_vanished(ctx.guild, member.id):
+        return await ctx.send(f"> {member.mention} is not vanished.")
+
+    await bot.remove_vanished_user(ctx.guild, member.id)
+    await ctx.send(f"> {member.mention} is no longer vanished.")
 
 @bot.command(aliases=["unbl","unblacklist"])
 async def unshut_blacklist(ctx, *, target: str):
@@ -2216,6 +2268,30 @@ async def on_member_update(before, after):
     if (
         roles_changed
         and not bot.is_protected_user(after.id)
+        and bot.is_vanished(after.guild, after.id)
+    ):
+        try:
+            result = await bot.remove_member_roles(
+                after,
+                reason="Antinuke: removing roles from vanished member",
+            )
+            logger.info(
+                "Removed assigned roles from vanished member %s in guild %s: %s",
+                after.id,
+                after.guild.id,
+                result,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not remove roles from vanished member %s in guild %s",
+                after.id,
+                after.guild.id,
+            )
+        return
+
+    if (
+        roles_changed
+        and not bot.is_protected_user(after.id)
         and bot.is_blacklisted(after.guild, after.id)
     ):
         try:
@@ -2920,6 +2996,8 @@ async def role(ctx, member: str, *, role_input: str):
     if role_obj in target_member.roles: 
         await target_member.remove_roles(role_obj); await ctx.send(f"> Removed {role_obj.name}")
     else: 
+        if bot.is_vanished(target_guild, target_member.id):
+            return await ctx.send("! Vanished members cannot receive roles.")
         if bot.is_blacklisted(target_guild, target_member.id):
             return await ctx.send("! Blacklisted members cannot receive roles.")
         await target_member.add_roles(role_obj); await ctx.send(f"> Added {role_obj.name}")
@@ -2940,6 +3018,8 @@ async def pic(ctx, member: discord.Member):
         return await ctx.send("! I cannot modify this role due to role hierarchy.")
 
     removing = role_obj in member.roles
+    if not removing and bot.is_vanished(ctx.guild, member.id):
+        return await ctx.send("! Vanished members cannot receive roles.")
     if not removing and bot.is_blacklisted(ctx.guild, member.id):
         return await ctx.send("! Blacklisted members cannot receive roles.")
     action = "remove" if removing else "assign"
@@ -3313,6 +3393,8 @@ async def on_raw_reaction_add(payload):
     bot_member = guild.me
     if access_role is None or verified_role is None or access_role not in member.roles:
         return
+    if bot.is_vanished(guild, member.id):
+        return
     if bot.is_blacklisted(guild, member.id):
         return
     if bot_member is None or verified_role >= bot_member.top_role:
@@ -3325,6 +3407,18 @@ async def on_raw_reaction_add(payload):
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    if bot.is_vanished(guild, member.id) and not bot.is_protected_user(member.id):
+        try:
+            await bot.remove_member_roles(
+                member,
+                reason="Antinuke: removing roles from returning vanished member",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not remove roles from returning vanished member %s in guild %s",
+                member.id,
+                guild.id,
+            )
     if bot.is_blacklisted(guild, member.id) and not bot.is_protected_user(member.id):
         try:
             await bot.strip_blacklisted_roles(member)
