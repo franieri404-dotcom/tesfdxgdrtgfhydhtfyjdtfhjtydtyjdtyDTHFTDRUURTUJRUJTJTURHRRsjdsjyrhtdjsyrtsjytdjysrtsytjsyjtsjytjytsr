@@ -37,6 +37,7 @@ last_deleted_messages: dict[int, discord.Message | None] = {}
 
 # --- Bot Configuration ---
 BLACKLIST_ROLE_ID =1497982597387780339   # Set your Blacklist role ID here if you want to use a fixed role
+BLACKLIST_PRESERVED_ROLE_ID = 1417634409074659398
 STATUS_MESSAGES = [
     "affective runs eu",
 
@@ -412,15 +413,15 @@ class AntiNukeBot(commands.Bot):
         if admin_roles:
             await member.remove_roles(*admin_roles, reason=reason)
 
-    async def strip_blacklisted_roles(self, member):
-        if self.is_protected_user(member.id):
-            return "This user is protected from bot moderation."
-
+    async def remove_member_roles(self, member, *, preserve_role_ids=(), reason):
         bot_member = member.guild.me
         if bot_member is None or not bot_member.guild_permissions.manage_roles:
             return "I need Manage Roles permission to remove this member's roles."
 
-        roles = [role for role in member.roles if not role.is_default()]
+        roles = [
+            role for role in member.roles
+            if not role.is_default() and role.id not in preserve_role_ids
+        ]
         removable_roles = [
             role for role in roles
             if not role.managed and role < bot_member.top_role
@@ -428,7 +429,7 @@ class AntiNukeBot(commands.Bot):
         if removable_roles:
             await member.remove_roles(
                 *removable_roles,
-                reason="Antinuke: removing roles from blacklisted member",
+                reason=reason,
             )
 
         skipped_count = len(roles) - len(removable_roles)
@@ -438,6 +439,16 @@ class AntiNukeBot(commands.Bot):
                 f"{skipped_count} managed or higher role(s). Check role hierarchy."
             )
         return f"Removed {len(removable_roles)} role(s)."
+
+    async def strip_blacklisted_roles(self, member):
+        if self.is_protected_user(member.id):
+            return "This user is protected from bot moderation."
+
+        return await self.remove_member_roles(
+            member,
+            preserve_role_ids={BLACKLIST_PRESERVED_ROLE_ID},
+            reason="Antinuke: removing roles from blacklisted member",
+        )
 
     def _prune_audit_log_entries(self, now):
         self._audit_log_entries = [
@@ -1420,6 +1431,34 @@ async def bl(ctx, *, target: str):
         logger.exception("Could not strip roles from blacklisted member %s in guild %s", member.id, ctx.guild.id)
         role_result = "Role removal failed; check my Manage Roles permission and role hierarchy."
     await ctx.send(f"> {member.mention} has been blacklisted. {role_result}")
+
+@bot.command()
+async def vanish(ctx, *, target: str):
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if not bot.is_whitelisted(ctx.guild, ctx.author.id):
+        return await ctx.send("! Only whitelisted users can use this command.")
+
+    member = await resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("! User not found.")
+    if bot.is_protected_user(member.id):
+        return await ctx.send("! This user is protected from bot moderation.")
+
+    try:
+        role_result = await bot.remove_member_roles(
+            member,
+            reason=f"Roles removed with -vanish by {ctx.author}",
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Could not remove roles from member %s with -vanish in guild %s",
+            member.id,
+            ctx.guild.id,
+        )
+        return await ctx.send("! Role removal failed; check my Manage Roles permission and role hierarchy.")
+
+    await ctx.send(f"> Removed roles from {member.mention}. {role_result}")
 
 @bot.command(aliases=["unbl","unblacklist"])
 async def unshut_blacklist(ctx, *, target: str):
