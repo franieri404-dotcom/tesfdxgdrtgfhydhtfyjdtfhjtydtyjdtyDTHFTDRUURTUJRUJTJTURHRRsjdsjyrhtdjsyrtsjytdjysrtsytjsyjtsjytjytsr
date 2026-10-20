@@ -869,15 +869,19 @@ WHITELIST_REQUIRED_COMMANDS = {
     "pings", "nuke", "joins", "leaves", "savetemp", "loadtemp", "clean", "role",
     "listtemp", "deletetemp",
 }
+BOT_OWNER_ONLY_COMMANDS = {
+    "an admin", "an on", "an off", "savetemp", "listtemp", "loadtemp",
+    "snap2", "unsnap2",
+}
 
 
 @bot.check
 async def antinuke_command_access(ctx):
     command_root = ctx.command.qualified_name.split()[0]
-    if ctx.command.qualified_name in {"an on", "an off"}:
+    if ctx.command.qualified_name in BOT_OWNER_ONLY_COMMANDS:
         if ctx.author.id == BOT_OWNER_ID:
             return True
-        await ctx.send("You can't use this command. Only the bot owner can manage antinuke settings globally.")
+        await ctx.send("! Only the bot owner can use this command.")
         return False
     now = time.monotonic()
     for user_id, timestamp in tuple(command_cooldowns.items()):
@@ -892,11 +896,6 @@ async def antinuke_command_access(ctx):
         if ctx.guild and (ctx.author.id == BOT_OWNER_ID or ctx.author.id == ctx.guild.owner_id):
             return True
         await ctx.send("You can't manage the command whitelist. Only this server's owner or the bot owner can do that.")
-        return False
-    if command_root in {"snap2", "unsnap2"}:
-        if ctx.guild and (ctx.author.id == BOT_OWNER_ID or ctx.author.id == ctx.guild.owner_id):
-            return True
-        await ctx.send("You can't use this command. It is restricted to this server's owner and the bot owner.")
         return False
     if command_root in WHITELIST_REQUIRED_COMMANDS:
         if ctx.guild and (
@@ -1165,6 +1164,8 @@ COMMAND_DESCRIPTIONS = {
     "strip": "Remove a member's dangerous roles, or their other removable roles if none are dangerous.",
     "bl": "Add a member to or remove them from the blacklist.",
     "unshut_blacklist": "Remove a member from the blacklist.",
+    "vanish": "Remove a member's roles and mark them as vanished.",
+    "unvanish": "Remove a member from the vanished list.",
     "kick": "Remove a member from this server.",
     "ban": "Ban a member from this server.",
     "unban": "Remove a member's ban from this server.",
@@ -1181,9 +1182,9 @@ COMMAND_DESCRIPTIONS = {
     "leaves": "Send member-leave notifications to this channel.",
     "s": "Show the latest deleted message saved by the bot in this channel.",
     "cs": "Clear the deleted-message record saved for this channel.",
-    "savetemp": "Save this server's channel and category layout under a name.",
-    "listtemp": "Show the names of channel-layout templates saved for this server.",
-    "loadtemp": "Replace this server's current channels and categories with a saved template.",
+    "savetemp": "Save this server's channel and category layout under a name (bot owner only).",
+    "listtemp": "Show the names of channel-layout templates saved for this server (bot owner only).",
+    "loadtemp": "Replace this server's current channels and categories with a saved template (bot owner only).",
     "deletetemp": "Delete a saved channel-layout template from this server.",
     "roles": "Show the server's roles in a paginated list.",
     "role": "Add the selected role to a member or remove it if they already have it.",
@@ -1204,8 +1205,8 @@ COMMAND_DESCRIPTIONS = {
     "ping": "Show the bot's connection latency to Discord in milliseconds.",
     "mc": "Show the number of members in this server.",
     "setverify": "Post your verification message and configure access and verified roles using their role IDs.",
-    "snap2": "Permanently ban a user (server owner or bot owner only).",
-    "unsnap2": "Remove a ban created with `-snap2` (server owner or bot owner only).",
+    "snap2": "Permanently ban a user (bot owner only).",
+    "unsnap2": "Remove a ban created with `-snap2` (bot owner only).",
     "execute": "Ban a user and record them, or use `-execute list` to view recorded users.",
     "pardon": "Unban a user and remove them from the executed-users record.",
     "c": "Delete a specified number of recent, unpinned messages.",
@@ -1838,6 +1839,7 @@ async def on_guild_channel_create(channel):
         and entry.user is not None
         and entry.user.id == JOIN_TO_CREATE_BOT_ID
     )
+
     if not is_join_to_create_channel and await bot.enforce_antinuke_action(
         guild, entry, "Unauthorized channel creation", details, delete_channel
     ):
