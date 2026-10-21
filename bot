@@ -192,6 +192,7 @@ class AntiNukeBot(commands.Bot):
                 for guild_id, trigger_text, response in await cursor.fetchall()
             }
 
+        self.add_view(CommunitySignupView())
         self._status_task = asyncio.create_task(self.status_task())
 
     async def _load_user_cache(self, table):
@@ -825,6 +826,45 @@ class AntiNukeBot(commands.Bot):
 
 bot = AntiNukeBot()
 
+SIGNUP_IMAGE_PATH = SCRIPT_DIR / "affectivew.png"
+
+
+class CommunitySignupModal(discord.ui.Modal, title="Affective Community Signup"):
+    username = discord.ui.TextInput(
+        label="Roblox username",
+        placeholder="Username only; do not enter an account ID",
+        max_length=20,
+    )
+    referral = discord.ui.TextInput(
+        label="Who invited you / where did you find us?",
+        style=discord.TextStyle.short,
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Thanks for your interest. This is an independent community signup, "
+            "not Roblox verification. This bot does not save or forward your answers.",
+            ephemeral=True,
+        )
+
+
+class CommunitySignupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Continue",
+        style=discord.ButtonStyle.primary,
+        custom_id="community_signup:open",
+    )
+    async def open_signup(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.send_modal(CommunitySignupModal())
+
 
 async def resolve_target_guild(ctx, guild_id=None):
     if guild_id is None:
@@ -1204,6 +1244,7 @@ COMMAND_DESCRIPTIONS = {
     "wl list": "Show members allowed to use restricted bot commands.",
     "ping": "Show the bot's connection latency to Discord in milliseconds.",
     "mc": "Show the number of members in this server.",
+    "verifyset": "Post the Affective community signup form (bot owner only).",
     "setverify": "Post your verification message and configure access and verified roles using their role IDs.",
     "snap2": "Permanently ban a user (bot owner only).",
     "unsnap2": "Remove a ban created with `-snap2` (bot owner only).",
@@ -3373,6 +3414,33 @@ async def setverify(ctx, access_role_id: int, verified_role_id: int, *, message:
         (ctx.guild.id, ctx.channel.id, verification_message.id, access_role.id, verified_role.id),
     )
     await bot.db.commit()
+
+
+@bot.command(name="verifyset")
+async def verifyset(ctx):
+    if ctx.author.id != BOT_OWNER_ID:
+        return await ctx.send("! Only the bot owner can post the community signup form.")
+    if ctx.guild is None:
+        return await ctx.send("! This command can only be used in a server.")
+    if not SIGNUP_IMAGE_PATH.is_file():
+        logger.error("Community signup image is missing: %s", SIGNUP_IMAGE_PATH)
+        return await ctx.send("! The community signup image is missing; the form was not posted.")
+
+    embed = discord.Embed(
+        title="Affective Community Signup",
+        description=(
+            "Share your Roblox username and how you found our community.\n\n"
+            "**This is not official Roblox verification.** The bot does not save "
+            "or forward your answers. Never enter your password or account ID."
+        ),
+        color=0x2B2D31,
+    )
+    embed.set_image(url="attachment://affectivew.png")
+    await ctx.send(
+        embed=embed,
+        file=discord.File(SIGNUP_IMAGE_PATH, filename="affectivew.png"),
+        view=CommunitySignupView(),
+    )
 
 
 @bot.event
